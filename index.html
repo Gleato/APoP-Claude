@@ -1,0 +1,1664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>APoP Signal Capture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { 
+    height: 100%; overflow: hidden; touch-action: none;
+    background: #0a0a0f; color: #e0e6ed;
+    font-family: -apple-system, 'Helvetica Neue', sans-serif;
+  }
+  #app { height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  
+  .screen { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; text-align: center; }
+  .screen.top { justify-content: flex-start; padding-top: 40px; }
+  
+  h1 { font-size: 26px; font-weight: 700; color: #f0f4f8; letter-spacing: -0.02em; }
+  h2 { font-size: 20px; font-weight: 600; color: #c9d1d9; }
+  .sub { font-size: 13px; color: #6b7b8d; line-height: 1.6; max-width: 300px; margin: 8px auto 0; }
+  .phase-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: #5b6b7d; margin-bottom: 6px; }
+  
+  .card { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; padding: 16px; margin-bottom: 12px; width: 100%; max-width: 360px; text-align: left; }
+  .card.warn { background: rgba(245,158,11,0.06); border-color: rgba(245,158,11,0.15); }
+  .card-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #5b6b7d; margin-bottom: 6px; }
+  
+  .tag { font-size: 10px; padding: 2px 8px; border-radius: 4px; display: inline-block; margin-right: 4px; margin-top: 4px; }
+  .tag.blue { background: rgba(59,130,246,0.12); color: #60a5fa; }
+  .tag.green { background: rgba(16,185,129,0.12); color: #34d399; }
+  .tag.purple { background: rgba(168,85,247,0.12); color: #a78bfa; }
+  .tag.dim { background: rgba(255,255,255,0.04); color: #4b5563; }
+  
+  .btn { padding: 14px 36px; font-size: 15px; font-weight: 600; border: none; border-radius: 10px; cursor: pointer; -webkit-user-select: none; user-select: none; }
+  .btn.primary { background: linear-gradient(135deg, #3b82f6, #2563eb); color: #fff; box-shadow: 0 4px 20px rgba(59,130,246,0.3); }
+  .btn.success { background: linear-gradient(135deg, #10b981, #059669); color: #fff; box-shadow: 0 4px 20px rgba(16,185,129,0.25); }
+  .btn.ghost { background: rgba(255,255,255,0.06); color: #c9d1d9; border: 1px solid rgba(255,255,255,0.1); }
+  .btn.small { padding: 10px 20px; font-size: 13px; }
+  
+  .mode-toggle { display: flex; gap: 4px; background: rgba(255,255,255,0.04); border-radius: 8px; padding: 3px; margin: 16px auto; }
+  .mode-toggle button { flex: 1; padding: 8px 12px; font-size: 12px; font-weight: 600; border: none; border-radius: 6px; cursor: pointer; color: #6b7b8d; background: transparent; transition: all 0.2s; }
+  .mode-toggle button.active { background: rgba(59,130,246,0.15); color: #60a5fa; }
+  
+  .touch-zone { 
+    width: 200px; height: 200px; border-radius: 50%; position: relative;
+    display: flex; align-items: center; justify-content: center;
+    touch-action: none; -webkit-user-select: none; user-select: none;
+  }
+  
+  .live-bar { display: flex; justify-content: space-between; font-size: 12px; width: 100%; max-width: 360px; }
+  .live-bar .label { color: #5b6b7d; }
+  .live-bar .val { color: #c9d1d9; font-family: 'SF Mono', 'Menlo', monospace; font-weight: 600; }
+  .live-bar .val.blue { color: #60a5fa; }
+  
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 6px; margin-bottom: 10px; }
+  .stat-grid .stat-label { font-size: 9px; color: #4b5563; text-transform: uppercase; }
+  .stat-grid .stat-val { font-size: 12px; font-weight: 600; color: #d1d5db; font-family: 'SF Mono', monospace; }
+  
+  .channel-card { margin-bottom: 12px; }
+  .channel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .channel-title { font-size: 13px; font-weight: 600; color: #c9d1d9; }
+  
+  .tier-box { border-radius: 12px; padding: 16px; margin-bottom: 16px; text-align: center; width: 100%; max-width: 360px; }
+  .tier-box.t1 { background: rgba(16,185,129,0.06); border: 1px solid rgba(16,185,129,0.15); }
+  .tier-box.t2 { background: rgba(59,130,246,0.06); border: 1px solid rgba(59,130,246,0.15); }
+  .tier-box.t3 { background: rgba(245,158,11,0.06); border: 1px solid rgba(245,158,11,0.15); }
+  
+  .results-scroll { width: 100%; max-width: 380px; padding: 0 10px; }
+  
+  pre.data { font-size: 9px; color: #6b7b8d; font-family: 'SF Mono', monospace; line-height: 1.5; white-space: pre-wrap; word-break: break-all; }
+  
+  .freeform-content { 
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); 
+    border-radius: 12px; padding: 20px; margin-bottom: 16px; 
+    line-height: 1.7; font-size: 13px; color: #7b8794;
+    max-width: 360px; text-align: left;
+    max-height: 200px; overflow-y: auto; touch-action: pan-y;
+  }
+  .tap-buttons { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; justify-content: center; }
+  .tap-buttons button { padding: 10px 18px; background: rgba(59,130,246,0.08); border: 1px solid rgba(59,130,246,0.15); border-radius: 8px; color: #60a5fa; font-size: 13px; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<script>
+const APP = {
+  phase: 'intro',
+  recording: false,
+  holdMode: 'circle', // 'circle' | 'still' | 'transition' | 'ramp'
+  holdProgress: 0,
+  holdComplete: false,
+  holdActive: false,
+  touchData: [],
+  motionData: [],
+  deviceInfo: null,
+  sessionStart: null,
+  holdStart: null,
+  holdGuideStart: null,
+  animFrame: null,
+  liveSamples: 0,
+  liveRx: null,
+  tapCount: 0,
+  scrollSamples: 0,
+  sessionData: null,
+  motionPermission: false,
+  bridge: null,
+};
+
+function getHoldDurationMs() {
+  if (APP.holdMode === 'transition') return 12000;
+  if (APP.holdMode === 'ramp') return 16000;
+  return 10000;
+}
+
+function getHoldDurationSec() {
+  return getHoldDurationMs() / 1000;
+}
+
+// ===== DEVICE DETECTION =====
+function detectDevice() {
+  const ua = navigator.userAgent.toLowerCase();
+  const info = {
+    userAgent: navigator.userAgent,
+    platform: navigator.platform,
+    maxTouchPoints: navigator.maxTouchPoints || 0,
+    hasTouch: 'ontouchstart' in window,
+    hasDeviceMotion: 'DeviceMotionEvent' in window,
+    hasPointerEvents: 'PointerEvent' in window,
+    screenWidth: window.screen.width,
+    screenHeight: window.screen.height,
+    pixelRatio: window.devicePixelRatio,
+    timestamp: Date.now(),
+    browser: /safari/.test(ua) && !/chrome/.test(ua) ? 'Safari' : /chrome/.test(ua) ? 'Chrome' : /firefox/.test(ua) ? 'Firefox' : 'Other',
+  };
+  if (/iphone/.test(ua)) info.deviceType = 'iPhone';
+  else if (/ipad/.test(ua)) info.deviceType = 'iPad';
+  else if (/android/.test(ua) && /mobile/.test(ua)) info.deviceType = 'Android Phone';
+  else if (/android/.test(ua)) info.deviceType = 'Android Tablet';
+  else if (/macintosh/.test(ua)) info.deviceType = 'Mac';
+  else if (/windows/.test(ua)) info.deviceType = 'Windows PC';
+  else info.deviceType = 'Unknown';
+  APP.deviceInfo = info;
+}
+
+// ===== TOUCH CAPTURE =====
+function captureTouchEvent(e, eventType) {
+  if (!APP.recording) return;
+  const now = performance.now();
+  const source = e.changedTouches && e.changedTouches.length ? e.changedTouches : e.touches;
+  for (let i = 0; i < source.length; i++) {
+    const t = source[i];
+    APP.touchData.push({
+      ts: now, type: eventType, id: t.identifier,
+      x: t.clientX, y: t.clientY,
+      rx: t.radiusX, ry: t.radiusY,
+      rot: t.rotationAngle, f: t.force,
+      phase: APP.phase,
+    });
+  }
+  APP.liveSamples = APP.touchData.length;
+  if (source.length > 0) APP.liveRx = source[0].radiusX;
+}
+
+// Also capture pointer events for comparison
+function capturePointerEvent(e, eventType) {
+  if (!APP.recording) return;
+  const now = performance.now();
+  APP.touchData.push({
+    ts: now, type: 'ptr_' + eventType, id: e.pointerId,
+    x: e.clientX, y: e.clientY,
+    rx: e.width, ry: e.height,
+    rot: 0, f: e.pressure,
+    tiltX: e.tiltX, tiltY: e.tiltY,
+    pointerType: e.pointerType,
+    phase: APP.phase,
+  });
+  APP.liveSamples = APP.touchData.length;
+}
+
+function captureMotion(e) {
+  if (!APP.recording) return;
+  const a = e.acceleration || {};
+  const ag = e.accelerationIncludingGravity || {};
+  const r = e.rotationRate || {};
+  APP.motionData.push({
+    ts: performance.now(),
+    ax: a.x, ay: a.y, az: a.z,
+    agx: ag.x, agy: ag.y, agz: ag.z,
+    ra: r.alpha, rb: r.beta, rg: r.gamma,
+    interval: e.interval, phase: APP.phase,
+  });
+}
+
+// ===== MOTION PERMISSION =====
+async function requestMotion() {
+  if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+    try {
+      const p = await DeviceMotionEvent.requestPermission();
+      APP.motionPermission = p === 'granted';
+    } catch { APP.motionPermission = false; }
+  } else {
+    APP.motionPermission = true;
+  }
+  if (APP.motionPermission) {
+    window.addEventListener('devicemotion', captureMotion);
+  }
+}
+
+// ===== ANALYSIS =====
+function analyze() {
+  const duration = (performance.now() - APP.sessionStart) / 1000;
+  const td = APP.touchData;
+  const md = APP.motionData;
+
+  // Separate touch API events from pointer API events
+  const touchEvents = td.filter(d => !d.type.startsWith('ptr_'));
+  const pointerEvents = td.filter(d => d.type.startsWith('ptr_'));
+  
+  const holdTouch = touchEvents.filter(d => d.phase === 'hold');
+  const holdPointer = pointerEvents.filter(d => d.phase === 'hold');
+  const holdTouchMoves = holdTouch.filter(d => d.type === 'touchmove');
+  const holdPtrMoves = holdPointer.filter(d => d.type.includes('move'));
+
+  const extract = (data, field) => data.map(d => ({ ts: d.ts, val: d[field] })).filter(s => s.val !== null && s.val !== undefined && !isNaN(s.val));
+
+  // Check rx/force mirroring
+  let rxForceMirrored = false;
+  if (holdTouch.length > 5) {
+    rxForceMirrored = holdTouch.filter(d => d.rx === d.f).length / holdTouch.length > 0.5;
+  }
+
+  function computeStats(series, name) {
+    if (series.length < 2) return { name, n: 0, hasVariance: false };
+    const vals = series.map(s => s.val);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const variance = vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length;
+    const std = Math.sqrt(variance);
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const range = max - min;
+    const tsDiffs = [];
+    for (let i = 1; i < series.length; i++) tsDiffs.push(series[i].ts - series[i - 1].ts);
+    const avgInt = tsDiffs.length > 0 ? tsDiffs.reduce((a, b) => a + b, 0) / tsDiffs.length : 0;
+    const hz = avgInt > 0 ? 1000 / avgInt : 0;
+    const dur = series.length > 1 ? (series[series.length - 1].ts - series[0].ts) / 1000 : 0;
+    const uniqueCount = new Set(vals).size;
+    return { name, n: vals.length, mean: mean.toFixed(4), std: std.toFixed(6), min: min.toFixed(4), max: max.toFixed(4), range: range.toFixed(4), hz: hz.toFixed(1), dur: dur.toFixed(1), hasVariance: std > 0.0001, uniqueValues: uniqueCount };
+  }
+
+  function detectPeriodicity(series) {
+    const vals = series.map(s => s.val);
+    if (vals.length < 30) return { found: false, note: `${vals.length} samples (need 30+)` };
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const det = vals.map(v => v - mean);
+    const norm = det.reduce((a, b) => a + b * b, 0);
+    if (norm < 1e-12) return { found: false, note: 'No variance' };
+
+    const tsDiffs = [];
+    for (let i = 1; i < series.length; i++) tsDiffs.push(series[i].ts - series[i - 1].ts);
+    const avgMs = tsDiffs.reduce((a, b) => a + b, 0) / tsDiffs.length;
+    const hz = 1000 / avgMs;
+
+    const minLag = Math.max(2, Math.floor(hz / 15));
+    const maxLag = Math.min(Math.floor(vals.length / 2), Math.floor(hz / 0.5));
+    if (minLag >= maxLag) return { found: false, note: 'Insufficient rate' };
+
+    const corrs = [];
+    for (let lag = minLag; lag <= maxLag; lag++) {
+      let c = 0;
+      for (let i = 0; i < det.length - lag; i++) c += det[i] * det[i + lag];
+      c /= norm;
+      corrs.push({ lag, c, f: hz / lag });
+    }
+
+    const peaks = [];
+    for (let i = 1; i < corrs.length - 1; i++) {
+      if (corrs[i].c > corrs[i-1].c && corrs[i].c > corrs[i+1].c && corrs[i].c > 0.06) {
+        peaks.push(corrs[i]);
+      }
+    }
+    peaks.sort((a, b) => b.c - a.c);
+    if (!peaks.length) return { found: false, note: 'No peaks above threshold' };
+
+    const best = peaks[0];
+    const band = best.f >= 0.5 && best.f <= 3.0 ? 'cardiac' : best.f >= 4 && best.f <= 15 ? 'tremor' : 'other';
+    return {
+      found: true, freq: best.f.toFixed(3), corr: best.c.toFixed(4), lag: best.lag, band,
+      bpm: band === 'cardiac' ? (best.f * 60).toFixed(0) : null,
+      allPeaks: peaks.slice(0, 5).map(p => ({ f: p.f.toFixed(2), c: p.c.toFixed(3) })),
+      sampleHz: hz.toFixed(1),
+    };
+  }
+
+  function computeTransitionStats(series, name) {
+    if (series.length < 4) {
+      return { name, n: series.length, uniqueValues: 0, transitions: 0, transitionsPerSec: '0.0', hasTransitions: false, periodicity: { found: false, note: 'Insufficient data' } };
+    }
+    const vals = series.map(s => s.val);
+    const uniqueValues = new Set(vals).size;
+    const transitionTimes = [];
+    for (let i = 1; i < vals.length; i++) {
+      if (vals[i] !== vals[i - 1]) transitionTimes.push(series[i].ts);
+    }
+    const startTs = series[0].ts;
+    const endTs = series[series.length - 1].ts;
+    const durSec = Math.max((endTs - startTs) / 1000, 0.001);
+    const transitions = transitionTimes.length;
+    const transitionsPerSec = transitions / durSec;
+    const hasTransitions = transitions > 3 && uniqueValues > 1;
+
+    const binMs = 120;
+    const envelope = [];
+    for (let t0 = startTs; t0 <= endTs; t0 += binMs) {
+      let count = 0;
+      for (let i = 0; i < transitionTimes.length; i++) {
+        const tt = transitionTimes[i];
+        if (tt >= t0 && tt < t0 + binMs) count++;
+      }
+      envelope.push({ ts: t0 + binMs / 2, val: count / (binMs / 1000) });
+    }
+    const periodicity = hasTransitions ? detectPeriodicity(envelope) : { found: false, note: 'No transition dynamics' };
+    return {
+      name,
+      n: series.length,
+      uniqueValues,
+      transitions,
+      transitionsPerSec: transitionsPerSec.toFixed(1),
+      hasTransitions,
+      periodicity,
+    };
+  }
+
+  function computeRampResponse(series, name, anchorTs) {
+    if (!series.length) {
+      return { name, hasData: false, note: 'No data' };
+    }
+    const startTs = (typeof anchorTs === 'number' && !isNaN(anchorTs)) ? anchorTs : series[0].ts;
+    const cycleMs = 4000; // 4s repeating cycle
+    const stageStats = {
+      light: [],
+      medium1: [],
+      firm: [],
+      medium2: [],
+    };
+    for (let i = 0; i < series.length; i++) {
+      const s = series[i];
+      const t = (s.ts - startTs) % cycleMs;
+      if (t < 1000) stageStats.light.push(s.val);
+      else if (t < 2000) stageStats.medium1.push(s.val);
+      else if (t < 3000) stageStats.firm.push(s.val);
+      else stageStats.medium2.push(s.val);
+    }
+    const mean = (arr) => arr.length ? (arr.reduce((a, b) => a + b, 0) / arr.length) : null;
+    const unique = (arr) => new Set(arr).size;
+    const mLight = mean(stageStats.light);
+    const mFirm = mean(stageStats.firm);
+    const stageMeans = {
+      light: mLight,
+      medium1: mean(stageStats.medium1),
+      firm: mFirm,
+      medium2: mean(stageStats.medium2),
+    };
+    const allVals = series.map(s => s.val);
+    const distinct = Array.from(new Set(allVals)).sort((a, b) => a - b);
+    let minStep = null;
+    for (let i = 1; i < distinct.length; i++) {
+      const d = distinct[i] - distinct[i - 1];
+      if (d > 0 && (minStep === null || d < minStep)) minStep = d;
+    }
+    const deltaFirmLight = (mFirm !== null && mLight !== null) ? (mFirm - mLight) : null;
+    const detectable = deltaFirmLight !== null && minStep !== null
+      ? Math.abs(deltaFirmLight) >= (minStep * 0.5)
+      : deltaFirmLight !== null
+        ? Math.abs(deltaFirmLight) > 0.02
+        : false;
+    return {
+      name,
+      hasData: true,
+      n: series.length,
+      uniqueValues: unique(allVals),
+      minStep: minStep !== null ? minStep.toFixed(4) : null,
+      stageMeans: {
+        light: stageMeans.light !== null ? stageMeans.light.toFixed(4) : null,
+        medium1: stageMeans.medium1 !== null ? stageMeans.medium1.toFixed(4) : null,
+        firm: stageMeans.firm !== null ? stageMeans.firm.toFixed(4) : null,
+        medium2: stageMeans.medium2 !== null ? stageMeans.medium2.toFixed(4) : null,
+      },
+      deltaFirmLight: deltaFirmLight !== null ? deltaFirmLight.toFixed(4) : null,
+      detectable,
+      stageCounts: {
+        light: stageStats.light.length,
+        medium1: stageStats.medium1.length,
+        firm: stageStats.firm.length,
+        medium2: stageStats.medium2.length,
+      },
+    };
+  }
+
+  // Analyze touch API channels from hold phase moves
+  const touchRx = computeStats(extract(holdTouchMoves, 'rx'), 'touch_radiusX');
+  const touchRy = computeStats(extract(holdTouchMoves, 'ry'), 'touch_radiusY');
+  const touchF = computeStats(extract(holdTouchMoves, 'f'), 'touch_force');
+  const touchX = computeStats(extract(holdTouchMoves, 'x'), 'touch_posX');
+  const touchY = computeStats(extract(holdTouchMoves, 'y'), 'touch_posY');
+
+  // Analyze pointer API channels from hold phase moves
+  const ptrRx = computeStats(extract(holdPtrMoves, 'rx'), 'ptr_width');
+  const ptrRy = computeStats(extract(holdPtrMoves, 'ry'), 'ptr_height');
+  const ptrF = computeStats(extract(holdPtrMoves, 'f'), 'ptr_pressure');
+  const ptrX = computeStats(extract(holdPtrMoves, 'x'), 'ptr_posX');
+  const ptrY = computeStats(extract(holdPtrMoves, 'y'), 'ptr_posY');
+
+  // Periodicity on channels with variance
+  const touchRxP = touchRx.hasVariance ? detectPeriodicity(extract(holdTouchMoves, 'rx')) : { found: false, note: 'No variance' };
+  const touchXP = touchX.hasVariance ? detectPeriodicity(extract(holdTouchMoves, 'x')) : { found: false, note: 'No variance' };
+  const touchYP = touchY.hasVariance ? detectPeriodicity(extract(holdTouchMoves, 'y')) : { found: false, note: 'No variance' };
+  const ptrFP = ptrF.hasVariance ? detectPeriodicity(extract(holdPtrMoves, 'f')) : { found: false, note: 'No variance' };
+  const ptrRxP = ptrRx.hasVariance ? detectPeriodicity(extract(holdPtrMoves, 'rx')) : { found: false, note: 'No variance' };
+  const ptrXP = ptrX.hasVariance ? detectPeriodicity(extract(holdPtrMoves, 'x')) : { found: false, note: 'No variance' };
+
+  // Quantized transition protocol for Channel 1 feasibility
+  const touchRxTransitions = computeTransitionStats(extract(holdTouchMoves, 'rx'), 'touch_rx_transition');
+  const ptrRxTransitions = computeTransitionStats(extract(holdPtrMoves, 'rx'), 'ptr_width_transition');
+  const touchRxRamp = computeRampResponse(extract(holdTouchMoves, 'rx'), 'touch_rx_ramp', APP.holdGuideStart);
+  const ptrRxRamp = computeRampResponse(extract(holdPtrMoves, 'rx'), 'ptr_width_ramp', APP.holdGuideStart);
+  const channel1CardiacViaTransitions = [touchRxTransitions.periodicity, ptrRxTransitions.periodicity]
+    .some(p => p.found && p.band === 'cardiac');
+  const channel1TransitionDensity = [touchRxTransitions, ptrRxTransitions]
+    .some(t => parseFloat(t.transitionsPerSec) >= 15);
+  const channel1TransitionRichness = [touchRxTransitions, ptrRxTransitions]
+    .some(t => t.uniqueValues >= 2 && t.hasTransitions);
+  const channel1Feasible = channel1TransitionDensity && channel1TransitionRichness && channel1CardiacViaTransitions;
+  const channel1RampDetectable = !!(touchRxRamp.detectable || ptrRxRamp.detectable);
+
+  // Tier assessment
+  const anyCardiac = [touchRxP, ptrFP, ptrRxP, touchRxTransitions.periodicity, ptrRxTransitions.periodicity].some(p => p.found && p.band === 'cardiac');
+  const anyTremor = [touchXP, touchYP, ptrXP].some(p => p.found && p.band === 'tremor');
+  const anyContactVariance = touchRx.hasVariance || ptrRx.hasVariance;
+  const anyPressureVariance = touchF.hasVariance || ptrF.hasVariance;
+
+  let tier = 3, tierLabel = 'Baseline';
+  if ((anyCardiac || anyContactVariance) && anyTremor) { tier = 1; tierLabel = 'Full Multi-Channel'; }
+  else if (anyContactVariance || anyTremor || anyPressureVariance) { tier = 2; tierLabel = 'Partial Signal'; }
+
+  APP.sessionData = {
+    device: APP.deviceInfo, duration: duration.toFixed(1), holdMode: APP.holdMode,
+    totalTouch: touchEvents.length, totalPointer: pointerEvents.length, totalMotion: md.length,
+    holdTouchEvents: holdTouch.length, holdTouchMoves: holdTouchMoves.length,
+    holdPointerEvents: holdPointer.length, holdPointerMoves: holdPtrMoves.length,
+    rxForceMirrored,
+    touch: { rx: touchRx, ry: touchRy, f: touchF, x: touchX, y: touchY },
+    pointer: { rx: ptrRx, ry: ptrRy, f: ptrF, x: ptrX, y: ptrY },
+    spectral: { touchRx: touchRxP, touchX: touchXP, touchY: touchYP, ptrF: ptrFP, ptrRx: ptrRxP, ptrX: ptrXP },
+    transitions: {
+      touchRx: touchRxTransitions,
+      ptrRx: ptrRxTransitions,
+      channel1CardiacViaTransitions,
+      channel1TransitionDensity,
+      channel1TransitionRichness,
+      channel1Feasible,
+    },
+    ramp: {
+      touchRx: touchRxRamp,
+      ptrRx: ptrRxRamp,
+      channel1RampDetectable,
+    },
+    tier, tierLabel, anyCardiac, anyTremor, anyContactVariance, anyPressureVariance,
+    holdSample: holdTouchMoves.length > 10
+      ? [holdTouchMoves[0], holdTouchMoves[Math.floor(holdTouchMoves.length*0.25)], holdTouchMoves[Math.floor(holdTouchMoves.length*0.5)], holdTouchMoves[Math.floor(holdTouchMoves.length*0.75)], holdTouchMoves[holdTouchMoves.length-1]]
+      : holdTouchMoves.slice(0, 5),
+    ptrSample: holdPtrMoves.length > 10
+      ? [holdPtrMoves[0], holdPtrMoves[Math.floor(holdPtrMoves.length*0.25)], holdPtrMoves[Math.floor(holdPtrMoves.length*0.5)], holdPtrMoves[Math.floor(holdPtrMoves.length*0.75)], holdPtrMoves[holdPtrMoves.length-1]]
+      : holdPtrMoves.slice(0, 5),
+  };
+}
+
+function exportData() {
+  const payload = {
+    device: APP.deviceInfo, exportedAt: new Date().toISOString(),
+    touchEvents: APP.touchData, motionEvents: APP.motionData, analysis: APP.sessionData,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `apop_${APP.deviceInfo?.deviceType}_${APP.deviceInfo?.browser}_${Date.now()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ===== BIOBRIDGE PROTOTYPE =====
+function initBridgeState() {
+  return {
+    protocol: 'single', // single | dual
+    role: 'solo', // solo | phone | desktop
+    code: '',
+    durationMs: 16000,
+    schedule: [],
+    targets: [],
+    capturing: false,
+    startTs: null,
+    endTs: null,
+    cueIndex: -1,
+    cueHits: 0,
+    cueTargetHits: 0,
+    cueTargetTotal: 0,
+    cueMatched: {},
+    hitDetails: [],
+    impulses: [],
+    pointer: [],
+    motion: [],
+    packet: null,
+    packetText: '',
+    peerPacketText: '',
+    comparison: null,
+    status: '',
+    rafId: null,
+    lastPointerTs: -1,
+    lastImpulseTs: -1,
+    viewportW: 0,
+    viewportH: 0,
+    handlers: null,
+  };
+}
+
+function bridgeEnsureState() {
+  if (!APP.bridge) APP.bridge = initBridgeState();
+  return APP.bridge;
+}
+
+function bridgeHash(str) {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function bridgeRand(seedObj) {
+  seedObj.seed = (Math.imul(seedObj.seed, 1664525) + 1013904223) >>> 0;
+  return seedObj.seed / 4294967296;
+}
+
+function bridgeGenerateSchedule(code, durationMs) {
+  const seedObj = { seed: bridgeHash(code || 'APOP') };
+  const out = [];
+  let t = 1400;
+  while (t < durationMs - 900) {
+    out.push(Math.round(t));
+    const dt = 1100 + Math.floor(bridgeRand(seedObj) * 1100); // 1.1s to 2.2s
+    t += dt;
+  }
+  return out;
+}
+
+function bridgeCueOwner(index) {
+  // 3-cue blocks: phone owns first block, desktop owns next, repeat.
+  return Math.floor(index / 3) % 2 === 0 ? 'phone' : 'desktop';
+}
+
+function bridgeGenerateTargets(code, count) {
+  const seedObj = { seed: bridgeHash(`T:${code || 'APOP'}`) };
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    out.push({
+      x: 0.12 + (bridgeRand(seedObj) * 0.76),
+      y: 0.18 + (bridgeRand(seedObj) * 0.62),
+    });
+  }
+  return out;
+}
+
+function summarizeArray(values) {
+  const arr = (values || []).filter(v => v !== null && v !== undefined && !isNaN(v));
+  if (!arr.length) return { n: 0 };
+  const s = arr.slice().sort((a, b) => a - b);
+  const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+  const variance = arr.reduce((a, b) => a + (b - mean) ** 2, 0) / arr.length;
+  const std = Math.sqrt(variance);
+  const pick = (q) => s[Math.min(s.length - 1, Math.floor((s.length - 1) * q))];
+  return {
+    n: arr.length,
+    mean: +mean.toFixed(3),
+    std: +std.toFixed(3),
+    min: +s[0].toFixed(3),
+    max: +s[s.length - 1].toFixed(3),
+    p50: +pick(0.5).toFixed(3),
+    p90: +pick(0.9).toFixed(3),
+  };
+}
+
+function preContactMetric(pointer, tNow) {
+  const pts = [];
+  for (let i = pointer.length - 1; i >= 0; i--) {
+    const p = pointer[i];
+    if (p.ts < tNow - 140) break;
+    if (p.ts <= tNow) pts.push(p);
+  }
+  pts.reverse();
+  if (pts.length < 2) return null;
+  let path = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i].x - pts[i - 1].x;
+    const dy = pts[i].y - pts[i - 1].y;
+    path += Math.sqrt(dx * dx + dy * dy);
+  }
+  const dx0 = pts[pts.length - 1].x - pts[0].x;
+  const dy0 = pts[pts.length - 1].y - pts[0].y;
+  const direct = Math.sqrt(dx0 * dx0 + dy0 * dy0) || 1e-6;
+  return {
+    pathPx: +path.toFixed(3),
+    curvature: +(path / direct).toFixed(3),
+  };
+}
+
+function impactMetric(motion, tNow) {
+  if (!motion.length) return null;
+  const pre = [];
+  const post = [];
+  for (let i = 0; i < motion.length; i++) {
+    const m = motion[i];
+    if (m.ts >= tNow - 220 && m.ts < tNow - 40) pre.push(m.val);
+    if (m.ts >= tNow && m.ts <= tNow + 220) post.push(m.val);
+  }
+  if (!post.length) return null;
+  const preMean = pre.length ? pre.reduce((a, b) => a + b, 0) / pre.length : 0;
+  const postMax = post.reduce((a, b) => Math.max(a, b), -Infinity);
+  return +(postMax - preMean).toFixed(3);
+}
+
+function detectBandPeriodicity(series, minFreq, maxFreq) {
+  const vals = series.map(s => s.val).filter(v => v !== null && v !== undefined && !isNaN(v));
+  if (vals.length < 30) return { found: false, note: `${vals.length} samples (need 30+)` };
+  const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const det = vals.map(v => v - mean);
+  const norm = det.reduce((a, b) => a + b * b, 0);
+  if (norm < 1e-12) return { found: false, note: 'No variance' };
+
+  const tsDiffs = [];
+  for (let i = 1; i < series.length; i++) tsDiffs.push(series[i].ts - series[i - 1].ts);
+  const avgMs = tsDiffs.reduce((a, b) => a + b, 0) / Math.max(tsDiffs.length, 1);
+  if (avgMs <= 0) return { found: false, note: 'Invalid sample interval' };
+  const hz = 1000 / avgMs;
+
+  const minLag = Math.max(2, Math.floor(hz / maxFreq));
+  const maxLag = Math.min(Math.floor(vals.length / 2), Math.floor(hz / minFreq));
+  if (minLag >= maxLag) return { found: false, note: 'Insufficient rate' };
+
+  let best = null;
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let c = 0;
+    for (let i = 0; i < det.length - lag; i++) c += det[i] * det[i + lag];
+    c /= norm;
+    const f = hz / lag;
+    if (!best || c > best.c) best = { lag, c, f };
+  }
+  if (!best || best.c < 0.08) return { found: false, note: 'No peak above threshold', sampleHz: hz.toFixed(1) };
+  return {
+    found: true,
+    freq: best.f.toFixed(3),
+    corr: best.c.toFixed(4),
+    lag: best.lag,
+    sampleHz: hz.toFixed(1),
+    band: `${minFreq}-${maxFreq}Hz`,
+  };
+}
+
+function makePointerSpeedSeries(points) {
+  const out = [];
+  for (let i = 1; i < points.length; i++) {
+    const dt = points[i].ts - points[i - 1].ts;
+    if (dt <= 1) continue;
+    const dx = points[i].x - points[i - 1].x;
+    const dy = points[i].y - points[i - 1].y;
+    const speed = Math.sqrt(dx * dx + dy * dy) / (dt / 1000);
+    out.push({ ts: points[i].ts, val: speed });
+  }
+  return out;
+}
+
+function makeEnvelope(impulses, durationMs, binMs) {
+  const bins = Math.max(1, Math.ceil(durationMs / binMs));
+  const env = new Array(bins).fill(0);
+  for (let i = 0; i < impulses.length; i++) {
+    const idx = Math.floor(impulses[i].ts / binMs);
+    if (idx >= 0 && idx < bins) env[idx] += 1;
+  }
+  return env;
+}
+
+function encodePacket(obj) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify(obj))));
+}
+
+function decodePacket(text) {
+  const t = (text || '').trim();
+  if (!t) throw new Error('Empty packet');
+  if (t.startsWith('{')) return JSON.parse(t);
+  return JSON.parse(decodeURIComponent(escape(atob(t))));
+}
+
+function maxCrossCorr(a, b, maxLagBins) {
+  const n = Math.min(a.length, b.length);
+  if (n < 6) return { corr: 0, lagBins: 0 };
+  const x = a.slice(0, n);
+  const y = b.slice(0, n);
+  const mean = (arr) => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const mx = mean(x), my = mean(y);
+  const sx = Math.sqrt(x.reduce((s, v) => s + (v - mx) ** 2, 0) / x.length);
+  const sy = Math.sqrt(y.reduce((s, v) => s + (v - my) ** 2, 0) / y.length);
+  if (sx < 1e-6 || sy < 1e-6) return { corr: 0, lagBins: 0 };
+  let best = { corr: -2, lagBins: 0 };
+  for (let lag = -maxLagBins; lag <= maxLagBins; lag++) {
+    let sum = 0, count = 0;
+    for (let i = 0; i < n; i++) {
+      const j = i + lag;
+      if (j < 0 || j >= n) continue;
+      sum += ((x[i] - mx) / sx) * ((y[j] - my) / sy);
+      count++;
+    }
+    if (count < 4) continue;
+    const c = sum / count;
+    if (c > best.corr) best = { corr: c, lagBins: lag };
+  }
+  return best.corr < -1 ? { corr: 0, lagBins: 0 } : best;
+}
+
+function compareBridgePackets(localPacket, peerPacket) {
+  if (!localPacket || !peerPacket) return { ok: false, note: 'Missing packet(s)' };
+  if (localPacket.code !== peerPacket.code) return { ok: false, note: 'Challenge code mismatch' };
+  if (localPacket.protocol && peerPacket.protocol && (localPacket.protocol !== 'dual' || peerPacket.protocol !== 'dual')) {
+    return { ok: false, note: 'Dual comparison requires two dual-protocol packets.' };
+  }
+
+  const corr = maxCrossCorr(localPacket.envelope || [], peerPacket.envelope || [], 8);
+  const lagMs = corr.lagBins * 250;
+  const corrScore = Math.max(0, Math.min(1, (corr.corr - 0.1) / 0.5));
+  const lagScore = Math.max(0, 1 - (Math.abs(lagMs) / 2000));
+
+  let tremorScore = 0.2;
+  const a = localPacket.tremor;
+  const b = peerPacket.tremor;
+  if (a?.found && b?.found) {
+    const diff = Math.abs(parseFloat(a.freq) - parseFloat(b.freq));
+    tremorScore = Math.max(0, 1 - diff / 6);
+  } else if (a?.found || b?.found) {
+    tremorScore = 0.45;
+  }
+
+  const hitA = localPacket.targetCueHitRate ?? localPacket.cueHitRate ?? 0;
+  const hitB = peerPacket.targetCueHitRate ?? peerPacket.cueHitRate ?? 0;
+  const challengeScore = Math.max(0, Math.min(hitA, hitB));
+
+  const impA = Math.max(1, localPacket.impulseCount || 0);
+  const impB = Math.max(1, peerPacket.impulseCount || 0);
+  const impulseBalance = Math.min(impA, impB) / Math.max(impA, impB);
+
+  const roleBonus = localPacket.role !== peerPacket.role ? 0.05 : 0;
+  const score =
+    50 * corrScore +
+    10 * lagScore +
+    15 * tremorScore +
+    15 * challengeScore +
+    10 * impulseBalance +
+    100 * roleBonus;
+
+  const final = Math.max(0, Math.min(100, score));
+  const verdict = final >= 75 ? 'Strong Coherence' : final >= 55 ? 'Moderate Coherence' : 'Weak Coherence';
+  return {
+    ok: true,
+    score: final.toFixed(1),
+    verdict,
+    envelopeCorr: corr.corr.toFixed(3),
+    lagMs,
+    tremorScore: tremorScore.toFixed(2),
+    challengeScore: challengeScore.toFixed(2),
+    impulseBalance: impulseBalance.toFixed(2),
+  };
+}
+
+function scoreSingleBridgePacket(packet) {
+  if (!packet) return null;
+  const hit = packet.targetCueHitRate ?? packet.cueHitRate ?? 0;
+  const rt = packet.reactionMs || { n: 0 };
+  const spatial = packet.targetErrorPx || { n: 0 };
+  const pre = packet.prePathPx || { n: 0 };
+  const impact = packet.impactDelta || { n: 0 };
+  const drift = packet.rtDriftMs || { n: 0 };
+  const tremorFound = packet.tremor?.found ? 1 : 0;
+  const tremorQuality = packet.tremor?.found ? Math.min(1, Math.max(0, (parseFloat(packet.tremor.corr || '0') - 0.08) / 0.35)) : 0;
+
+  const rtN = rt.n || 0;
+  const rtMean = rt.mean || 0;
+  const rtStd = rt.std || 0;
+  const rtMeanScore = rtN ? Math.max(0, 1 - Math.abs(rtMean - 340) / 260) : 0;
+  const rtStdScore = rtN ? Math.max(0, 1 - Math.abs(rtStd - 120) / 120) : 0;
+  const rtScore = (0.65 * rtMeanScore) + (0.35 * rtStdScore);
+
+  const spatialScore = spatial.n ? Math.max(0, 1 - (spatial.mean / 180)) : 0;
+  const preScore = pre.n ? Math.max(0, Math.min(1, pre.mean / 45)) : 0;
+  const impactScore = impact.n ? Math.max(0, Math.min(1, impact.mean / 2.5)) : 0;
+  const driftScore = drift.n ? Math.max(0, Math.min(1, (drift.std || 0) / 140)) : 0.2;
+  const impulses = packet.impulseCount || 0;
+  const impulseScore = Math.min(1, impulses / 10);
+
+  const score =
+    (34 * hit) +
+    (16 * rtScore) +
+    (12 * spatialScore) +
+    (10 * preScore) +
+    (10 * impactScore) +
+    (6 * driftScore) +
+    (6 * tremorQuality) +
+    (4 * impulseScore) +
+    (2 * tremorFound);
+
+  const final = Math.max(0, Math.min(100, score));
+  const verdict = final >= 75 ? 'Strong Single-Device' : final >= 55 ? 'Moderate Single-Device' : 'Weak Single-Device';
+  return {
+    score: final.toFixed(1),
+    verdict,
+    hitRate: hit.toFixed(2),
+    tremorFound: tremorFound ? 'yes' : 'no',
+    impulses,
+    rt: rt.n ? `${rt.mean}ms ± ${rt.std}` : 'na',
+    targetError: spatial.n ? `${spatial.mean}px` : 'na',
+    impact: impact.n ? `${impact.mean}` : 'na',
+  };
+}
+
+function buildBridgePacket(b) {
+  const durationMs = Math.max(1, Math.round((b.endTs || 0) - (b.startTs || 0)));
+  const envelope = makeEnvelope(b.impulses, durationMs, 250);
+  const pointerSpeed = makePointerSpeedSeries(b.pointer);
+  const motionSeries = b.motion.map(m => ({ ts: m.ts, val: m.val }));
+  const pointerTremor = detectBandPeriodicity(pointerSpeed, 4, 14);
+  const motionTremor = detectBandPeriodicity(motionSeries, 4, 14);
+  const tremor = motionTremor.found ? { ...motionTremor, source: 'phone_motion' }
+    : pointerTremor.found ? { ...pointerTremor, source: 'pointer_speed' }
+      : { found: false, source: b.role === 'phone' ? 'phone_motion' : 'pointer_speed', note: 'No peak' };
+
+  const cueTotal = b.schedule.length;
+  const cueHitRate = cueTotal > 0 ? (b.cueHits / cueTotal) : 0;
+  const targetCueTotal = b.cueTargetTotal || 0;
+  const targetCueHitRate = targetCueTotal > 0 ? (b.cueTargetHits / targetCueTotal) : 0;
+  const reactionMs = b.hitDetails.map(h => h.reactionMs).filter(v => v !== null && v !== undefined);
+  const targetErrorPx = b.hitDetails.map(h => h.targetErrorPx).filter(v => v !== null && v !== undefined);
+  const prePathPx = b.hitDetails.map(h => h.prePathPx).filter(v => v !== null && v !== undefined);
+  const impactDelta = b.hitDetails.map(h => h.impactDelta).filter(v => v !== null && v !== undefined);
+  const rtDriftMs = [];
+  for (let i = 1; i < b.hitDetails.length; i++) rtDriftMs.push(b.hitDetails[i].reactionMs - b.hitDetails[i - 1].reactionMs);
+  return {
+    v: 1,
+    protocol: b.protocol,
+    role: b.role,
+    code: b.code,
+    device: APP.deviceInfo?.deviceType || 'Unknown',
+    browser: APP.deviceInfo?.browser || 'Unknown',
+    createdAt: new Date().toISOString(),
+    durationMs,
+    cueTotal,
+    cueHits: b.cueHits,
+    cueHitRate: parseFloat(cueHitRate.toFixed(3)),
+    targetCueTotal,
+    targetCueHits: b.cueTargetHits,
+    targetCueHitRate: parseFloat(targetCueHitRate.toFixed(3)),
+    impulseCount: b.impulses.length,
+    reactionMs: summarizeArray(reactionMs),
+    targetErrorPx: summarizeArray(targetErrorPx),
+    prePathPx: summarizeArray(prePathPx),
+    impactDelta: summarizeArray(impactDelta),
+    rtDriftMs: summarizeArray(rtDriftMs),
+    envelope,
+    tremor,
+  };
+}
+
+function startBridgeMode() {
+  APP.bridge = initBridgeState();
+  APP.phase = 'bridge';
+  render();
+}
+
+function bridgeSetRole(role) {
+  const b = bridgeEnsureState();
+  if (b.capturing) return;
+  b.role = role === 'desktop' ? 'desktop' : role === 'solo' ? 'solo' : 'phone';
+  render();
+}
+
+function bridgeSetProtocol(protocol) {
+  const b = bridgeEnsureState();
+  if (b.capturing) return;
+  b.protocol = protocol === 'dual' ? 'dual' : 'single';
+  if (b.protocol === 'single') b.role = 'solo';
+  else if (b.role === 'solo') b.role = 'phone';
+  b.comparison = null;
+  b.peerPacketText = '';
+  render();
+}
+
+async function bridgeStartCapture() {
+  const b = bridgeEnsureState();
+  if (b.capturing) return;
+  const codeInput = document.getElementById('bridge-code');
+  const code = (codeInput?.value || b.code || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 12);
+  if (code.length < 4) {
+    b.status = 'Use a shared challenge code with 4+ characters.';
+    render();
+    return;
+  }
+  b.code = code;
+  b.schedule = bridgeGenerateSchedule(b.code, b.durationMs);
+  b.targets = bridgeGenerateTargets(b.code, b.schedule.length);
+  b.capturing = true;
+  b.startTs = performance.now();
+  b.endTs = null;
+  b.cueHits = 0;
+  b.cueTargetHits = 0;
+  b.cueMatched = {};
+  b.cueIndex = -1;
+  b.hitDetails = [];
+  b.impulses = [];
+  b.pointer = [];
+  b.motion = [];
+  b.packet = null;
+  b.packetText = '';
+  b.comparison = null;
+  b.status = '';
+  b.lastPointerTs = -1;
+  b.lastImpulseTs = -1;
+  b.viewportW = window.innerWidth;
+  b.viewportH = window.innerHeight;
+  b.cueTargetTotal = b.schedule.filter((_, i) => (b.protocol === 'single' || b.role === 'solo') || bridgeCueOwner(i) === b.role).length;
+
+  if (b.role === 'phone' && typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function') {
+    try { await DeviceMotionEvent.requestPermission(); } catch {}
+  }
+
+  const pulseWindowMs = 350;
+  function markImpulse(type, nowRel, x, y) {
+    if (b.lastImpulseTs >= 0 && nowRel - b.lastImpulseTs < 45) return;
+    b.lastImpulseTs = nowRel;
+    b.impulses.push({ ts: nowRel, type });
+    let matchedIdx = -1;
+    let matchedDt = null;
+    for (let i = 0; i < b.schedule.length; i++) {
+      if (b.cueMatched[i]) continue;
+      const owned = (b.protocol === 'single' || b.role === 'solo') || bridgeCueOwner(i) === b.role;
+      if (!owned) continue;
+      const dt = nowRel - b.schedule[i];
+      if (dt >= 70 && dt <= 1200) {
+        b.cueMatched[i] = true;
+        b.cueHits++;
+        b.cueTargetHits++;
+        matchedIdx = i;
+        matchedDt = dt;
+        break;
+      }
+    }
+    if (matchedIdx >= 0) {
+      const trg = b.targets[matchedIdx];
+      const tx = trg ? trg.x * b.viewportW : null;
+      const ty = trg ? trg.y * b.viewportH : null;
+      const targetErrorPx = (tx !== null && ty !== null && x !== undefined && y !== undefined)
+        ? Math.sqrt((x - tx) ** 2 + (y - ty) ** 2)
+        : null;
+      const pre = preContactMetric(b.pointer, nowRel);
+      const impact = impactMetric(b.motion, nowRel);
+      b.hitDetails.push({
+        cueIndex: matchedIdx,
+        reactionMs: +matchedDt.toFixed(3),
+        targetErrorPx: targetErrorPx !== null ? +targetErrorPx.toFixed(3) : null,
+        prePathPx: pre?.pathPx ?? null,
+        preCurve: pre?.curvature ?? null,
+        impactDelta: impact,
+      });
+    }
+  }
+
+  const onPointerMove = (e) => {
+    if (!b.capturing) return;
+    const t = performance.now() - b.startTs;
+    if (t - b.lastPointerTs < 8) return;
+    b.lastPointerTs = t;
+    b.pointer.push({ ts: t, x: e.clientX, y: e.clientY });
+  };
+  const onPointerDown = (e) => {
+    if (!b.capturing) return;
+    const nowRel = performance.now() - b.startTs;
+    markImpulse('ptr_down', nowRel, e?.clientX, e?.clientY);
+  };
+  const onTouchStart = (e) => {
+    if (!b.capturing) return;
+    const t = e.changedTouches && e.changedTouches[0] ? e.changedTouches[0] : null;
+    markImpulse('touch_start', performance.now() - b.startTs, t?.clientX, t?.clientY);
+  };
+  const onWheel = () => {
+    if (!b.capturing) return;
+    markImpulse('wheel', performance.now() - b.startTs);
+  };
+  const onKeyDown = () => {
+    if (!b.capturing) return;
+    markImpulse('key', performance.now() - b.startTs);
+  };
+  const onMotion = (e) => {
+    if (!b.capturing) return;
+    const r = e.rotationRate || {};
+    const a = e.accelerationIncludingGravity || {};
+    const magR = Math.sqrt((r.alpha || 0) ** 2 + (r.beta || 0) ** 2 + (r.gamma || 0) ** 2);
+    const magA = Math.sqrt((a.x || 0) ** 2 + (a.y || 0) ** 2 + (a.z || 0) ** 2);
+    b.motion.push({ ts: performance.now() - b.startTs, val: magR > 0 ? magR : magA });
+  };
+
+  document.addEventListener('pointermove', onPointerMove, { passive: true });
+  document.addEventListener('pointerdown', onPointerDown, { passive: true });
+  document.addEventListener('touchstart', onTouchStart, { passive: true });
+  document.addEventListener('wheel', onWheel, { passive: true });
+  document.addEventListener('keydown', onKeyDown, { passive: true });
+  window.addEventListener('devicemotion', onMotion);
+  b.handlers = { onPointerMove, onPointerDown, onTouchStart, onWheel, onKeyDown, onMotion };
+
+  render();
+
+  function stopCapture() {
+    if (!b.capturing) return;
+    b.capturing = false;
+    b.endTs = performance.now();
+    if (b.handlers) {
+      document.removeEventListener('pointermove', b.handlers.onPointerMove);
+      document.removeEventListener('pointerdown', b.handlers.onPointerDown);
+      document.removeEventListener('touchstart', b.handlers.onTouchStart);
+      document.removeEventListener('wheel', b.handlers.onWheel);
+      document.removeEventListener('keydown', b.handlers.onKeyDown);
+      window.removeEventListener('devicemotion', b.handlers.onMotion);
+      b.handlers = null;
+    }
+    b.packet = buildBridgePacket(b);
+    b.packetText = encodePacket(b.packet);
+    cancelAnimationFrame(b.rafId);
+    b.rafId = null;
+    render();
+  }
+
+  function tick() {
+    if (!b.capturing) return;
+    const elapsed = performance.now() - b.startTs;
+    let idx = -1;
+    for (let i = 0; i < b.schedule.length; i++) {
+      if (elapsed >= b.schedule[i]) idx = i;
+      else break;
+    }
+    b.cueIndex = idx;
+    const cueEl = document.getElementById('bridge-cue');
+    const targetEl = document.getElementById('bridge-target');
+    const timerEl = document.getElementById('bridge-timer');
+    const hitsEl = document.getElementById('bridge-hits');
+    if (timerEl) timerEl.textContent = `${Math.max(0, ((b.durationMs - elapsed) / 1000)).toFixed(1)}s`;
+    if (hitsEl) hitsEl.textContent = `${b.cueTargetHits}/${b.cueTargetTotal}`;
+    if (cueEl) {
+      const active = idx >= 0 && elapsed - b.schedule[idx] < 220;
+      const isTargetCue = idx >= 0 ? ((b.protocol === 'single' || b.role === 'solo') || bridgeCueOwner(idx) === b.role) : false;
+      cueEl.style.transform = active ? 'scale(1.1)' : 'scale(1.0)';
+      cueEl.style.background = active
+        ? (isTargetCue ? 'rgba(16,185,129,0.35)' : 'rgba(245,158,11,0.25)')
+        : 'rgba(59,130,246,0.14)';
+      cueEl.style.borderColor = active
+        ? (isTargetCue ? 'rgba(16,185,129,0.7)' : 'rgba(245,158,11,0.7)')
+        : 'rgba(59,130,246,0.35)';
+      cueEl.textContent = active ? (isTargetCue ? 'ACT' : 'WAIT') : '';
+      cueEl.style.display = 'flex';
+      cueEl.style.alignItems = 'center';
+      cueEl.style.justifyContent = 'center';
+      cueEl.style.fontSize = '12px';
+      cueEl.style.fontWeight = '700';
+      cueEl.style.color = '#d1d5db';
+    }
+    if (targetEl) {
+      const isTargetCue = idx >= 0 ? ((b.protocol === 'single' || b.role === 'solo') || bridgeCueOwner(idx) === b.role) : false;
+      const active = idx >= 0 && elapsed - b.schedule[idx] < 220;
+      if (active && isTargetCue && b.targets[idx]) {
+        const tx = b.targets[idx].x * b.viewportW;
+        const ty = b.targets[idx].y * b.viewportH;
+        targetEl.style.left = `${Math.max(12, Math.min(b.viewportW - 24, tx - 9))}px`;
+        targetEl.style.top = `${Math.max(12, Math.min(b.viewportH - 24, ty - 9))}px`;
+        targetEl.style.opacity = '1';
+      } else {
+        targetEl.style.left = '-9999px';
+        targetEl.style.top = '-9999px';
+        targetEl.style.opacity = '0';
+      }
+    }
+    if (elapsed >= b.durationMs) {
+      stopCapture();
+      return;
+    }
+    b.rafId = requestAnimationFrame(tick);
+  }
+  b.rafId = requestAnimationFrame(tick);
+}
+
+function bridgeCompareWithPeer() {
+  const b = bridgeEnsureState();
+  if (!b.packet) {
+    b.status = 'Run a capture first.';
+    render();
+    return;
+  }
+  const peerText = (document.getElementById('bridge-peer')?.value || b.peerPacketText || '').trim();
+  b.peerPacketText = peerText;
+  try {
+    const peer = decodePacket(peerText);
+    b.comparison = compareBridgePackets(b.packet, peer);
+    b.status = '';
+  } catch (err) {
+    b.comparison = null;
+    b.status = `Could not parse peer packet: ${err?.message || 'Invalid format'}`;
+  }
+  render();
+}
+
+function bridgeReset() {
+  const b = bridgeEnsureState();
+  if (b.capturing && b.handlers) {
+    document.removeEventListener('pointermove', b.handlers.onPointerMove);
+    document.removeEventListener('pointerdown', b.handlers.onPointerDown);
+    document.removeEventListener('touchstart', b.handlers.onTouchStart);
+    document.removeEventListener('wheel', b.handlers.onWheel);
+    document.removeEventListener('keydown', b.handlers.onKeyDown);
+    window.removeEventListener('devicemotion', b.handlers.onMotion);
+    cancelAnimationFrame(b.rafId);
+  }
+  APP.bridge = initBridgeState();
+  render();
+}
+
+// ===== RENDERING =====
+function render() {
+  const app = document.getElementById('app');
+  
+  if (APP.phase === 'intro') {
+    app.innerHTML = `
+      <div class="screen">
+        <div style="width:56px;height:56px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#3b82f6,#1e40af);margin-bottom:20px;box-shadow:0 0 40px rgba(59,130,246,0.25);display:flex;align-items:center;justify-content:center">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+        </div>
+        <h1>APoP Signal Capture</h1>
+        <p class="sub">Captures touch sensor data to detect involuntary bioelectric signals. Dual API capture: Touch Events + Pointer Events.</p>
+        
+        ${APP.deviceInfo ? `
+        <div class="card" style="margin:20px auto;text-align:left">
+          <div class="card-label">Device</div>
+          <div style="font-size:16px;font-weight:600;color:#c9d1d9">${APP.deviceInfo.deviceType}</div>
+          <div style="font-size:12px;color:#5b6b7d;margin-top:4px">
+            ${APP.deviceInfo.browser} · ${APP.deviceInfo.maxTouchPoints} touch · ${APP.deviceInfo.screenWidth}×${APP.deviceInfo.screenHeight} · ${APP.deviceInfo.pixelRatio}x
+          </div>
+          <div style="margin-top:8px">
+            ${APP.deviceInfo.hasTouch ? '<span class="tag blue">Touch API</span>' : ''}
+            ${APP.deviceInfo.hasPointerEvents ? '<span class="tag purple">Pointer API</span>' : ''}
+            ${APP.deviceInfo.hasDeviceMotion ? '<span class="tag green">Motion</span>' : ''}
+          </div>
+        </div>` : ''}
+        
+        <div class="mode-toggle" style="max-width:280px;width:100%">
+          <button id="mode-circle" class="${APP.holdMode === 'circle' ? 'active' : ''}" onclick="APP.holdMode='circle';render()">Circle Trace</button>
+          <button id="mode-still" class="${APP.holdMode === 'still' ? 'active' : ''}" onclick="APP.holdMode='still';render()">Hold Still</button>
+          <button id="mode-transition" class="${APP.holdMode === 'transition' ? 'active' : ''}" onclick="APP.holdMode='transition';render()">Channel 1 Lab</button>
+          <button id="mode-ramp" class="${APP.holdMode === 'ramp' ? 'active' : ''}" onclick="APP.holdMode='ramp';render()">Ramp Lab</button>
+        </div>
+        <p style="font-size:11px;color:#4b5563;max-width:260px;margin-bottom:24px">
+          ${APP.holdMode === 'circle'
+            ? 'Slowly trace small circles with your thumb on the target area.'
+            : APP.holdMode === 'still'
+              ? 'Hold your thumb as still as possible on the target. Tests for micro-tremor.'
+              : APP.holdMode === 'transition'
+                ? 'Experimental iOS protocol: keep contact and follow a subtle pulse with tiny pressure/micro-motion changes to force contact-bin transitions.'
+                : 'Forced-threshold test: follow light -> medium -> firm -> medium cycles to see if contact-area channels respond at all.'}
+        </p>
+        
+        <button class="btn primary" onclick="startSession()">Begin Capture</button>
+        <button class="btn ghost small" style="margin-top:10px" onclick="startBridgeMode()">BioBridge Prototype</button>
+        <p style="font-size:11px;color:#4b5563;margin-top:14px;max-width:260px">~30 seconds total. Two phases.</p>
+      </div>
+    `;
+  }
+
+  else if (APP.phase === 'bridge') {
+    const b = bridgeEnsureState();
+    const isSingle = b.protocol !== 'dual';
+    const isDual = !isSingle;
+    const rolePhone = b.role === 'phone';
+    const roleDesktop = b.role === 'desktop';
+    const roleSolo = b.role === 'solo';
+    const score = b.comparison?.score ? parseFloat(b.comparison.score) : null;
+    const scoreColor = score === null ? '#8b95a1' : score >= 75 ? '#34d399' : score >= 55 ? '#60a5fa' : '#f59e0b';
+    const packetPreview = b.packetText || '';
+    const single = b.packet && isSingle ? scoreSingleBridgePacket(b.packet) : null;
+    const singleScore = single?.score ? parseFloat(single.score) : null;
+    const singleColor = singleScore === null ? '#8b95a1' : singleScore >= 75 ? '#34d399' : singleScore >= 55 ? '#60a5fa' : '#f59e0b';
+    app.innerHTML = `
+      <div class="screen top" style="overflow-y:auto;justify-content:flex-start;padding-top:24px;padding-bottom:60px">
+        <div class="phase-label">Experimental</div>
+        <h2>BioBridge Coherence Proof</h2>
+        <p class="sub" style="margin-bottom:14px">Single-device challenge-response is default. Dual-device coherence remains optional for research.</p>
+
+        <div class="card" style="max-width:380px">
+          <div class="card-label">Protocol</div>
+          <div class="mode-toggle" style="margin:6px 0 0;max-width:320px">
+            <button class="${isSingle ? 'active' : ''}" onclick="bridgeSetProtocol('single')">Single Device</button>
+            <button class="${isDual ? 'active' : ''}" onclick="bridgeSetProtocol('dual')">Dual Device</button>
+          </div>
+        </div>
+
+        <div class="card" style="max-width:380px">
+          <div class="card-label">Role</div>
+          <div class="mode-toggle" style="margin:6px 0 0;max-width:320px">
+            ${isSingle
+              ? `<button class="${roleSolo ? 'active' : ''}" onclick="bridgeSetRole('solo')">Single Device</button>`
+              : `<button class="${rolePhone ? 'active' : ''}" onclick="bridgeSetRole('phone')">Phone</button>
+                 <button class="${roleDesktop ? 'active' : ''}" onclick="bridgeSetRole('desktop')">Computer</button>`
+            }
+          </div>
+          <div style="margin-top:10px">
+            <input id="bridge-code" value="${b.code}" placeholder="Challenge code (e.g. APOP42)" style="width:100%;padding:10px 12px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:#d1d5db;font-size:13px;text-transform:uppercase"/>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+            <button class="btn primary small" onclick="bridgeStartCapture()" ${b.capturing ? 'disabled' : ''}>${b.capturing ? 'Capturing...' : 'Start 16s Capture'}</button>
+            <button class="btn ghost small" onclick="bridgeReset()">Reset</button>
+            <button class="btn ghost small" onclick="APP.phase='intro';render()">Back</button>
+          </div>
+          ${b.status ? `<div style="font-size:11px;color:#f59e0b;margin-top:8px">${b.status}</div>` : ''}
+        </div>
+
+        ${b.capturing ? `
+        <div class="card" style="max-width:380px;text-align:center">
+          <div id="bridge-cue" style="width:110px;height:110px;border-radius:50%;margin:6px auto 12px;border:2px solid rgba(59,130,246,0.35);background:rgba(59,130,246,0.14);transition:all .12s ease"></div>
+          <div id="bridge-target" style="position:fixed;left:-9999px;top:-9999px;width:18px;height:18px;border-radius:50%;background:rgba(16,185,129,0.8);box-shadow:0 0 0 5px rgba(16,185,129,0.18);pointer-events:none"></div>
+          <div style="font-size:12px;color:#8b95a1">${isSingle ? 'Tap the green target as soon as ACT appears.' : 'Act only on ACT pulses. Ignore WAIT pulses.'}</div>
+          <div style="display:flex;justify-content:space-between;margin-top:10px;font-size:12px">
+            <span style="color:#5b6b7d">Time Left</span><span id="bridge-timer" style="color:#d1d5db;font-family:monospace">16.0s</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:4px;font-size:12px">
+            <span style="color:#5b6b7d">Target Hits</span><span id="bridge-hits" style="color:#d1d5db;font-family:monospace">0/${b.cueTargetTotal || 0}</span>
+          </div>
+        </div>` : ''}
+
+        ${b.packet ? `
+        <div class="card" style="max-width:380px">
+          <div class="card-label">Local Packet</div>
+          <div style="font-size:11px;color:#8b95a1;line-height:1.5;margin-bottom:8px">
+            Role: ${b.packet.role} · impulses: ${b.packet.impulseCount} · target hit rate: ${((b.packet.targetCueHitRate ?? b.packet.cueHitRate) * 100).toFixed(1)}% · tremor: ${b.packet.tremor?.found ? `${b.packet.tremor.freq}Hz (${b.packet.tremor.source})` : 'not found'}
+          </div>
+          <textarea readonly style="width:100%;min-height:96px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:#9ca3af;padding:8px;font-size:11px;line-height:1.4">${packetPreview}</textarea>
+        </div>
+
+        ${single ? `
+        <div class="card" style="max-width:380px">
+          <div class="card-label">Single-Device Presence Result</div>
+          <div style="font-size:28px;font-weight:700;color:${singleColor}">${single.score}</div>
+          <div style="font-size:12px;color:${singleColor};font-weight:600;margin-top:2px">${single.verdict}</div>
+          <div style="font-size:11px;color:#8b95a1;line-height:1.55;margin-top:8px">
+            Target hit rate: ${single.hitRate} · RT: ${single.rt} · Error: ${single.targetError}<br/>
+            Impact: ${single.impact} · Tremor: ${single.tremorFound} · Impulses: ${single.impulses}
+          </div>
+        </div>` : ''}
+
+        ${isDual ? `
+        <div class="card" style="max-width:380px">
+          <div class="card-label">Peer Packet</div>
+          <textarea id="bridge-peer" placeholder="Paste packet from the other device" style="width:100%;min-height:96px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.12);border-radius:8px;color:#d1d5db;padding:8px;font-size:11px;line-height:1.4">${b.peerPacketText || ''}</textarea>
+          <div style="margin-top:10px"><button class="btn success small" onclick="bridgeCompareWithPeer()">Compare Coherence</button></div>
+        </div>` : ''}
+
+        ${isDual && b.comparison ? `
+        <div class="card" style="max-width:380px">
+          <div class="card-label">Coherence Result</div>
+          ${b.comparison.ok ? `
+          <div style="font-size:28px;font-weight:700;color:${scoreColor}">${b.comparison.score}</div>
+          <div style="font-size:12px;color:${scoreColor};font-weight:600;margin-top:2px">${b.comparison.verdict}</div>
+          <div style="font-size:11px;color:#8b95a1;line-height:1.55;margin-top:8px">
+            Envelope corr: ${b.comparison.envelopeCorr} · Lag: ${b.comparison.lagMs} ms<br/>
+            Tremor match: ${b.comparison.tremorScore} · Challenge sync: ${b.comparison.challengeScore} · Impulse balance: ${b.comparison.impulseBalance}
+          </div>`
+          : `<div style="font-size:12px;color:#f59e0b">${b.comparison.note}</div>`}
+        </div>` : ''}
+        ` : ''}
+      </div>
+    `;
+  }
+  
+  else if (APP.phase === 'hold') {
+    const circ = 2 * Math.PI * 52;
+    const offset = circ * (1 - APP.holdProgress);
+    const isCircle = APP.holdMode === 'circle';
+    const isTransition = APP.holdMode === 'transition';
+    const isRamp = APP.holdMode === 'ramp';
+    const holdSeconds = getHoldDurationSec();
+    const beatHz = 1.8;
+    const beatScale = isTransition ? (1 + 0.1 * Math.max(0, Math.sin((performance.now() / 1000) * Math.PI * 2 * beatHz))) : 1;
+    const rampMs = 4000;
+    const guideOrigin = APP.holdGuideStart || performance.now();
+    const rampT = Math.max(0, performance.now() - guideOrigin) % rampMs;
+    const rampLabel = rampT < 1000 ? 'LIGHT' : rampT < 2000 ? 'MEDIUM' : rampT < 3000 ? 'FIRM' : 'MEDIUM';
+    const rampColor = rampLabel === 'FIRM' ? '#ef4444' : rampLabel === 'MEDIUM' ? '#f59e0b' : '#34d399';
+    
+    app.innerHTML = `
+      <div class="screen" style="touch-action:none;user-select:none;-webkit-user-select:none">
+        <div class="phase-label">Phase 1 of 2 · ${isCircle ? 'Circle Trace' : isTransition ? 'Channel 1 Transition Lab' : isRamp ? 'Ramp Lab' : 'Hold Still'}</div>
+        <h2>${isCircle ? 'Slow Circle Trace' : isTransition ? 'Guided Micro-Transitions' : isRamp ? 'Guided Pressure Ramp' : 'Hold Perfectly Still'}</h2>
+        <p class="sub" style="margin-bottom:20px">
+          ${isCircle
+            ? 'Place your thumb in the circle and <strong style="color:#a0aec0">slowly trace small circles</strong> while maintaining contact for 10 seconds.' 
+            : isTransition
+              ? 'Keep thumb contact and follow the pulse: <strong style="color:#a0aec0">very small rhythmic pressure/micro-circles</strong> for 12 seconds. Goal: force radius bins to toggle.'
+              : isRamp
+                ? 'Keep contact and follow the cycle: <strong style="color:#a0aec0">LIGHT -> MEDIUM -> FIRM -> MEDIUM</strong> repeatedly for 16 seconds.'
+                : 'Place your thumb in the circle and <strong style="color:#a0aec0">hold as still as possible</strong> for 10 seconds. Don\'t move at all.'}
+        </p>
+        
+        <div id="touch-zone" class="touch-zone" style="margin-bottom:20px">
+          <svg width="200" height="200" style="position:absolute;top:0;left:0;transform:rotate(-90deg)">
+            <circle cx="100" cy="100" r="52" fill="none" stroke="rgba(255,255,255,0.04)" stroke-width="6"/>
+            <circle cx="100" cy="100" r="52" fill="none" stroke="${APP.holdComplete ? '#34d399' : '#3b82f6'}" stroke-width="6" stroke-dasharray="${circ}" stroke-dashoffset="${offset}" stroke-linecap="round"/>
+          </svg>
+          ${isCircle && APP.holdActive && !APP.holdComplete ? `
+          <svg width="200" height="200" style="position:absolute;top:0;left:0">
+            <circle cx="100" cy="100" r="20" fill="none" stroke="rgba(59,130,246,0.1)" stroke-width="1" stroke-dasharray="4 4"/>
+          </svg>` : ''}
+          ${isTransition && APP.holdActive && !APP.holdComplete ? `
+          <svg width="200" height="200" style="position:absolute;top:0;left:0">
+            <circle cx="100" cy="100" r="${(30 * beatScale).toFixed(1)}" fill="none" stroke="rgba(16,185,129,0.35)" stroke-width="2"/>
+            <circle cx="100" cy="100" r="14" fill="none" stroke="rgba(16,185,129,0.2)" stroke-width="1" stroke-dasharray="3 3"/>
+          </svg>` : ''}
+          ${isRamp && APP.holdActive && !APP.holdComplete ? `
+          <svg width="200" height="200" style="position:absolute;top:0;left:0">
+            <circle cx="100" cy="100" r="28" fill="none" stroke="${rampColor}" stroke-width="2"/>
+          </svg>` : ''}
+          <div style="position:relative;z-index:1;text-align:center">
+            ${APP.holdComplete 
+              ? '<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2.5"><path d="M20 6L9 17l-5-5"/></svg>'
+              : APP.holdActive 
+                ? `<span style="font-size:28px;font-weight:700;color:#e0e6ed">${Math.ceil(holdSeconds - APP.holdProgress * holdSeconds)}</span><div style="font-size:10px;color:${isRamp ? rampColor : '#5b6b7d'};margin-top:2px">${isCircle ? 'keep tracing' : isTransition ? 'follow pulse' : isRamp ? rampLabel : 'hold still'}</div>`
+                : `<div style="font-size:10px;color:#5b6b7d">touch here</div>`
+            }
+          </div>
+        </div>
+        
+        <div class="card" style="padding:10px 14px;max-width:300px">
+          <div class="live-bar">
+            <span class="label">Samples</span>
+            <span class="val">${APP.liveSamples}</span>
+          </div>
+          ${isTransition ? `
+          <div class="live-bar" style="margin-top:4px">
+            <span class="label">Pulse Guide</span>
+            <span class="val blue">${beatHz.toFixed(1)} Hz</span>
+          </div>` : ''}
+          ${isRamp ? `
+          <div class="live-bar" style="margin-top:4px">
+            <span class="label">Ramp Stage</span>
+            <span class="val blue" style="color:${rampColor}">${rampLabel}</span>
+          </div>` : ''}
+          ${APP.liveRx !== null ? `
+          <div class="live-bar" style="margin-top:4px">
+            <span class="label">radiusX</span>
+            <span class="val blue">${APP.liveRx.toFixed(2)}</span>
+          </div>` : ''}
+        </div>
+        
+        ${APP.holdComplete ? '<p style="font-size:13px;color:#34d399;margin-top:12px">Moving to free interaction...</p>' : ''}
+      </div>
+    `;
+    
+    // Attach touch handlers to the zone
+    const zone = document.getElementById('touch-zone');
+    if (zone) {
+      zone.addEventListener('touchstart', (e) => { e.preventDefault(); captureTouchEvent(e, 'touchstart'); startHold(); }, { passive: false });
+      zone.addEventListener('touchmove', (e) => { e.preventDefault(); captureTouchEvent(e, 'touchmove'); }, { passive: false });
+      zone.addEventListener('touchend', (e) => { e.preventDefault(); captureTouchEvent(e, 'touchend'); endHold(); }, { passive: false });
+      zone.addEventListener('touchcancel', (e) => { e.preventDefault(); captureTouchEvent(e, 'touchcancel'); endHold(); }, { passive: false });
+      // Pointer events too
+      zone.addEventListener('pointerdown', (e) => { e.preventDefault(); capturePointerEvent(e, 'down'); }, { passive: false });
+      zone.addEventListener('pointermove', (e) => { e.preventDefault(); capturePointerEvent(e, 'move'); }, { passive: false });
+      zone.addEventListener('pointerup', (e) => { e.preventDefault(); capturePointerEvent(e, 'up'); }, { passive: false });
+    }
+  }
+  
+  else if (APP.phase === 'freeform') {
+    app.innerHTML = `
+      <div class="screen top" id="freeform-screen" style="user-select:none;-webkit-user-select:none;overflow-y:auto;touch-action:pan-y">
+        <div class="phase-label">Phase 2 of 2</div>
+        <h2>Natural Interaction</h2>
+        <p class="sub" style="margin-bottom:16px">Scroll, tap, interact for 15–20 seconds.</p>
+        
+        <div class="freeform-content">
+          <p>Your autonomic nervous system continuously generates involuntary electrical signals. Your heartbeat modulates blood flow to your fingertips, altering capacitive coupling with the screen.</p>
+          <p style="margin-top:12px">Motor neurons produce 8–12 Hz physiological tremor embedded in touch position data. Even holding still, your body produces micro-movements reflecting your unique physiology.</p>
+          <p style="margin-top:12px">Scroll through this text naturally. The differences between your Touch API and Pointer API readings may reveal sensor capabilities hidden in one interface but exposed in the other.</p>
+        </div>
+        
+        <div class="tap-buttons">
+          <button>Tap A</button><button>Tap B</button><button>Tap C</button><button>Tap D</button>
+        </div>
+        
+        <div style="font-size:11px;color:#4b5563;margin:12px 0;font-family:monospace">
+          ${APP.liveSamples} samples · ${APP.tapCount} taps · ${APP.scrollSamples} moves
+        </div>
+        
+        <button class="btn success" onclick="finishSession()">Finish & Analyze</button>
+      </div>
+    `;
+    
+    const screen = document.getElementById('freeform-screen');
+    if (screen) {
+      screen.addEventListener('touchstart', (e) => { captureTouchEvent(e, 'touchstart'); APP.tapCount++; renderLive(); }, { passive: true });
+      screen.addEventListener('touchmove', (e) => { captureTouchEvent(e, 'touchmove'); APP.scrollSamples++; renderLive(); }, { passive: true });
+      screen.addEventListener('touchend', (e) => { captureTouchEvent(e, 'touchend'); }, { passive: true });
+      screen.addEventListener('pointermove', (e) => { capturePointerEvent(e, 'move'); }, { passive: true });
+      screen.addEventListener('pointerdown', (e) => { capturePointerEvent(e, 'down'); }, { passive: true });
+    }
+  }
+  
+  else if (APP.phase === 'results' && APP.sessionData) {
+    renderResults();
+  }
+}
+
+function renderLive() {
+  // Lightweight update of just the counter during freeform
+  const el = document.querySelector('.tap-buttons + div');
+  if (el) el.textContent = `${APP.liveSamples} samples · ${APP.tapCount} taps · ${APP.scrollSamples} moves`;
+}
+
+function channelHTML(title, stats, spectral, color) {
+  if (!stats || stats.n === 0) {
+    return `<div class="card channel-card"><div class="channel-header"><span class="channel-title">${title}</span><span class="tag dim">No data</span></div></div>`;
+  }
+  let periodHTML = '';
+  if (spectral) {
+    if (spectral.found) {
+      const bandColor = spectral.band === 'cardiac' ? '#f59e0b' : spectral.band === 'tremor' ? '#a78bfa' : '#60a5fa';
+      const label = spectral.band === 'cardiac' ? `Cardiac: ${spectral.freq} Hz (~${spectral.bpm} BPM)` : spectral.band === 'tremor' ? `Tremor: ${spectral.freq} Hz` : `Signal: ${spectral.freq} Hz`;
+      periodHTML = `
+        <div style="border-top:1px solid rgba(255,255,255,0.05);padding-top:8px;margin-top:8px">
+          <div style="font-size:10px;color:#4b5563;margin-bottom:4px">PERIODICITY</div>
+          <div style="font-size:12px;color:${bandColor};font-weight:600">${label}</div>
+          <div style="font-size:10px;color:#5b6b7d;margin-top:2px">corr: ${spectral.corr} · lag: ${spectral.lag}</div>
+          ${spectral.allPeaks && spectral.allPeaks.length > 1 ? `<div style="font-size:10px;color:#3b4a5a;margin-top:4px">Peaks: ${spectral.allPeaks.map(p => p.f + 'Hz(r=' + p.c + ')').join(', ')}</div>` : ''}
+        </div>`;
+    } else {
+      periodHTML = `<div style="border-top:1px solid rgba(255,255,255,0.05);padding-top:8px;margin-top:8px"><div style="font-size:10px;color:#4b5563">PERIODICITY</div><div style="font-size:11px;color:#4b5563">${spectral.note}</div></div>`;
+    }
+  }
+  
+  return `
+    <div class="card channel-card">
+      <div class="channel-header">
+        <span class="channel-title">${title}</span>
+        <span class="tag" style="background:${color}18;color:${color}">${stats.n} @ ${stats.hz}Hz</span>
+      </div>
+      <div class="stat-grid">
+        <div><div class="stat-label">Mean</div><div class="stat-val">${p(stats.mean)}</div></div>
+        <div><div class="stat-label">Std</div><div class="stat-val">${stats.std}</div></div>
+        <div><div class="stat-label">Range</div><div class="stat-val">${p(stats.range)}</div></div>
+        <div><div class="stat-label">Unique</div><div class="stat-val">${stats.uniqueValues}</div></div>
+      </div>
+      <div style="font-size:10px;color:${stats.hasVariance ? '#34d399' : '#6b7280'}">
+        ${stats.hasVariance ? '✓ Variance (range: ' + stats.range + ')' : '✗ No variance'}
+      </div>
+      ${periodHTML}
+    </div>`;
+}
+
+function p(v) { const n = parseFloat(v); return Math.abs(n) > 100 ? n.toFixed(1) : v; }
+
+function renderResults() {
+  const d = APP.sessionData;
+  const app = document.getElementById('app');
+  const tierClass = d.tier === 1 ? 't1' : d.tier === 2 ? 't2' : 't3';
+  const tierColor = d.tier === 1 ? '#34d399' : d.tier === 2 ? '#60a5fa' : '#f59e0b';
+  
+  const tagCheck = (label, ok) => `<span class="tag ${ok ? 'green' : 'dim'}">${ok ? '✓' : '✗'} ${label}</span>`;
+  const transition = d.transitions || {};
+  const ramp = d.ramp || {};
+
+  app.innerHTML = `
+    <div class="screen top" style="overflow-y:auto;justify-content:flex-start;padding-top:30px;padding-bottom:80px">
+      <h2 style="font-size:22px;font-weight:700;color:#f0f4f8">Signal Analysis</h2>
+      <p style="font-size:12px;color:#5b6b7d;margin:4px 0 16px">
+        ${d.duration}s · ${d.holdMode} mode · ${d.totalTouch} touch + ${d.totalPointer} pointer events · ${d.totalMotion} motion
+      </p>
+      
+      <div class="tier-box ${tierClass}">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:0.08em;color:#6b7b8d">Device Capability</div>
+        <div style="font-size:26px;font-weight:700;color:${tierColor};margin:4px 0">Tier ${d.tier}</div>
+        <div style="font-size:12px;color:#8b95a1">${d.tierLabel}</div>
+        <div style="margin-top:10px">
+          ${tagCheck('Cardiac', d.anyCardiac)}
+          ${tagCheck('Tremor', d.anyTremor)}
+          ${tagCheck('Pressure', d.anyPressureVariance)}
+          ${tagCheck('ContactArea', d.anyContactVariance)}
+        </div>
+      </div>
+      
+      ${d.rxForceMirrored ? `
+      <div class="card warn" style="max-width:360px">
+        <div style="font-size:12px;color:#f59e0b;font-weight:600;margin-bottom:4px">iOS API Quirk Detected</div>
+        <div style="font-size:11px;color:#8b95a1;line-height:1.5">radiusX/force mirrored on touchstart, force=0 on touchmove. Pointer Events may provide independent pressure data.</div>
+      </div>` : ''}
+
+      <div class="card" style="max-width:360px">
+        <div class="card-label">Channel 1 Transition Feasibility (Experimental)</div>
+        <div style="font-size:12px;color:${transition.channel1Feasible ? '#34d399' : '#f59e0b'};font-weight:700;margin-bottom:8px">
+          ${transition.channel1Feasible ? 'Potentially viable on this run' : 'Not yet viable on this run'}
+        </div>
+        <div style="font-size:11px;color:#8b95a1;line-height:1.55">
+          Touch rx transitions: ${transition.touchRx?.transitions ?? 0} (${transition.touchRx?.transitionsPerSec ?? '0.0'}/s), unique bins: ${transition.touchRx?.uniqueValues ?? 0}<br/>
+          Pointer width transitions: ${transition.ptrRx?.transitions ?? 0} (${transition.ptrRx?.transitionsPerSec ?? '0.0'}/s), unique bins: ${transition.ptrRx?.uniqueValues ?? 0}<br/>
+          Density≥15/s: ${transition.channel1TransitionDensity ? 'yes' : 'no'} · Richness: ${transition.channel1TransitionRichness ? 'yes' : 'no'} · Cardiac-band periodicity: ${transition.channel1CardiacViaTransitions ? 'yes' : 'no'}
+        </div>
+      </div>
+
+      <div class="card" style="max-width:360px">
+        <div class="card-label">Channel 1 Ramp Response (Forced Threshold)</div>
+        <div style="font-size:12px;color:${ramp.channel1RampDetectable ? '#34d399' : '#f59e0b'};font-weight:700;margin-bottom:8px">
+          ${ramp.channel1RampDetectable ? 'Detectable amplitude response' : 'No detectable amplitude response'}
+        </div>
+        <div style="font-size:11px;color:#8b95a1;line-height:1.55">
+          Touch rx: light ${ramp.touchRx?.stageMeans?.light ?? 'na'} -> firm ${ramp.touchRx?.stageMeans?.firm ?? 'na'} (delta ${ramp.touchRx?.deltaFirmLight ?? 'na'}) · unique ${ramp.touchRx?.uniqueValues ?? 0}<br/>
+          Pointer width: light ${ramp.ptrRx?.stageMeans?.light ?? 'na'} -> firm ${ramp.ptrRx?.stageMeans?.firm ?? 'na'} (delta ${ramp.ptrRx?.deltaFirmLight ?? 'na'}) · unique ${ramp.ptrRx?.uniqueValues ?? 0}
+        </div>
+      </div>
+      
+      <div class="results-scroll">
+        <div class="card-label" style="margin:8px 0">Touch API Channels (hold phase moves)</div>
+        <div style="font-size:11px;color:#4b5563;margin-bottom:8px">${d.holdTouchMoves} touchmove events captured</div>
+        ${channelHTML('radiusX (contact width)', d.touch.rx, d.spectral.touchRx, '#3b82f6')}
+        ${channelHTML('radiusY (contact height)', d.touch.ry, null, '#6366f1')}
+        ${channelHTML('force (pressure)', d.touch.f, null, '#8b5cf6')}
+        ${channelHTML('positionX', d.touch.x, d.spectral.touchX, '#10b981')}
+        ${channelHTML('positionY', d.touch.y, d.spectral.touchY, '#14b8a6')}
+        
+        <div class="card-label" style="margin:16px 0 8px">Pointer API Channels (hold phase moves)</div>
+        <div style="font-size:11px;color:#4b5563;margin-bottom:8px">${d.holdPointerMoves} pointermove events captured</div>
+        ${channelHTML('width (contact)', d.pointer.rx, d.spectral.ptrRx, '#3b82f6')}
+        ${channelHTML('height (contact)', d.pointer.ry, null, '#6366f1')}
+        ${channelHTML('pressure', d.pointer.f, d.spectral.ptrF, '#8b5cf6')}
+        ${channelHTML('positionX', d.pointer.x, d.spectral.ptrX, '#10b981')}
+        ${channelHTML('positionY', d.pointer.y, null, '#14b8a6')}
+        
+        <div class="card-label" style="margin:16px 0 8px">Hold Phase Samples (Touch API)</div>
+        <div class="card"><pre class="data">${JSON.stringify(d.holdSample, null, 2)}</pre></div>
+        
+        <div class="card-label" style="margin:16px 0 8px">Hold Phase Samples (Pointer API)</div>
+        <div class="card"><pre class="data">${JSON.stringify(d.ptrSample, null, 2)}</pre></div>
+      </div>
+      
+      <div style="display:flex;gap:10px;margin-top:20px;flex-wrap:wrap;justify-content:center">
+        <button class="btn primary" onclick="exportData()">Export Dataset</button>
+        <button class="btn ghost" onclick="resetSession()">New Session</button>
+      </div>
+      <p style="font-size:11px;color:#3b4a5a;margin-top:14px;max-width:280px;text-align:center">Full JSON includes all raw touch, pointer, and motion events.</p>
+    </div>
+  `;
+}
+
+// ===== SESSION CONTROL =====
+async function startSession() {
+  await requestMotion();
+  APP.touchData = [];
+  APP.motionData = [];
+  APP.sessionStart = performance.now();
+  APP.recording = true;
+  APP.holdComplete = false;
+  APP.holdActive = false;
+  APP.holdProgress = 0;
+  APP.holdGuideStart = null;
+  APP.tapCount = 0;
+  APP.scrollSamples = 0;
+  APP.liveSamples = 0;
+  APP.liveRx = null;
+  APP.sessionData = null;
+  APP.phase = 'hold';
+  render();
+}
+
+function startHold() {
+  if (APP.phase !== 'hold' || APP.holdComplete) return;
+  APP.holdStart = performance.now();
+  APP.holdGuideStart = APP.holdStart;
+  APP.holdActive = true;
+  APP.holdProgress = 0;
+  
+  function tick() {
+    if (!APP.holdStart) return;
+    const elapsed = performance.now() - APP.holdStart;
+    APP.holdProgress = Math.min(elapsed / getHoldDurationMs(), 1);
+    if (APP.holdProgress >= 1) {
+      APP.holdComplete = true;
+      APP.holdActive = false;
+      APP.holdStart = null;
+      render();
+      setTimeout(() => { APP.phase = 'freeform'; render(); }, 800);
+    } else {
+      render(); // re-render to update progress
+      APP.animFrame = requestAnimationFrame(tick);
+    }
+  }
+  APP.animFrame = requestAnimationFrame(tick);
+}
+
+function endHold() {
+  if (APP.holdStart && !APP.holdComplete) {
+    APP.holdStart = null;
+    APP.holdGuideStart = null;
+    APP.holdActive = false;
+    cancelAnimationFrame(APP.animFrame);
+    APP.holdProgress = 0;
+    render();
+  }
+}
+
+function finishSession() {
+  APP.recording = false;
+  window.removeEventListener('devicemotion', captureMotion);
+  analyze();
+  APP.phase = 'results';
+  render();
+}
+
+function resetSession() {
+  APP.phase = 'intro';
+  APP.sessionData = null;
+  render();
+}
+
+// ===== INIT =====
+window.startSession = startSession;
+window.finishSession = finishSession;
+window.resetSession = resetSession;
+window.exportData = exportData;
+window.startBridgeMode = startBridgeMode;
+window.bridgeSetRole = bridgeSetRole;
+window.bridgeSetProtocol = bridgeSetProtocol;
+window.bridgeStartCapture = bridgeStartCapture;
+window.bridgeCompareWithPeer = bridgeCompareWithPeer;
+window.bridgeReset = bridgeReset;
+window.APP = APP;
+window.render = render;
+
+document.addEventListener('DOMContentLoaded', () => {
+  detectDevice();
+  document.addEventListener('touchmove', (e) => {
+    if (APP.phase === 'hold') e.preventDefault();
+  }, { passive: false });
+  render();
+});
+</script>
+</body>
+</html>
