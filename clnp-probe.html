@@ -1879,12 +1879,22 @@ const Scorer = {
     }
 
     // 5. Cross-Axis Coupling (weight: 2)
+    // AGENT COOKIE CRUMB: On touch input, cross-axis coupling is naturally much
+    // higher than mouse/trackpad because: (1) finger-on-glass has lateral slippage
+    // during corrective movements, (2) holding a phone engages different wrist
+    // mechanics than a mouse on a desk, (3) the large touch contact area causes
+    // small diagonal movements to register as significant Y displacement.
+    // Desktop mouse coupling is typically 0.03-2.0; touch coupling is 1.0-8.0+.
+    // We scale thresholds by input method to avoid penalizing legitimate touch users.
     if (results.crossAxis && results.crossAxis.valid) {
       const ca = results.crossAxis;
-      // Should have some coupling but not too much
-      const s = Math.min(1, ca.meanCoupling / 0.3) * (ca.meanCoupling < 2 ? 1 : 0.5);
+      const isTouch = results.inputMethod === 'touch';
+      // Touch: higher coupling is natural; scale thresholds accordingly
+      const idealMax = isTouch ? 8 : 2;
+      const scoreDenom = isTouch ? 1.0 : 0.3;
+      const s = Math.min(1, ca.meanCoupling / scoreDenom) * (ca.meanCoupling < idealMax ? 1 : 0.5);
       scores.crossAxis = { score: s, weight: 2, label: 'Cross-Axis Coupling',
-        detail: `Mean coupling: ${ca.meanCoupling.toFixed(3)} (Y response per unit X perturbation)` };
+        detail: `Mean coupling: ${ca.meanCoupling.toFixed(3)} (Y response per unit X perturbation)${isTouch ? ' [touch-adjusted]' : ''}` };
       weightedSum += s * 2; totalWeight += 2; validCount++;
     }
 
