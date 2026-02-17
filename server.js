@@ -8,10 +8,14 @@
  * uses only Node.js built-in modules.
  *
  * Endpoints:
- *   POST /api/challenge  — Generate a new challenge with randomized params
- *   POST /api/verify     — Verify raw data against a challenge
- *   GET  /api/health     — Health check
- *   GET  /               — Serve clnp-probe.html
+ *   POST /api/challenge        — Generate standalone challenge with randomized params
+ *   POST /api/verify           — Verify standalone raw data against a challenge
+ *   POST /api/embed/challenge  — Generate embed challenge (smaller perturbations)
+ *   POST /api/embed/verify     — Verify embed browsing data (7 metrics, no cognitive)
+ *   GET  /api/health           — Health check
+ *   GET  /                     — Serve clnp-probe.html
+ *   GET  /clnp-embed.js        — Serve embed client library
+ *   GET  /clnp-embed-demo.html — Serve embed demo page
  */
 
 "use strict";
@@ -21,7 +25,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URL } = require("url");
-const { analyze } = require("./analysis.js");
+const { analyze, analyzeEmbed } = require("./analysis.js");
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -276,6 +280,76 @@ function clientParams(challenge) {
 }
 
 
+// ─── EMBED CHALLENGE GENERATION ─────────────────────────────
+// AGENT COOKIE CRUMB: Embed challenges use smaller perturbation amplitudes
+// (1-2px multi-sine, 3-5px pulses) so they're imperceptible when applied
+// as CSS transforms to hovered elements. No path params (element center
+// is the target). No cognitive task. Pulses are spaced in cumulative
+// hover-time domain — they fire after enough hover interaction.
+
+function generateEmbedChallenge() {
+  const challengeId = crypto.randomBytes(16).toString("hex");
+  const now = Date.now();
+
+  // Same probe frequency pool, smaller amplitudes (1-2px)
+  const probeFreqsPicked = pickRandom(FREQ_POOL, 5).sort((a, b) => a - b);
+  const probes = probeFreqsPicked.map(freq => ({
+    freq,
+    ampX: +(randRange(0.8, 2.0)).toFixed(2),
+    ampY: +(randRange(0.3, 1.0)).toFixed(2),
+    phaseOffset: Math.PI / 3 + randRange(-0.3, 0.3),
+  }));
+
+  // Embed pulses: spaced every ~2s of cumulative hover time, amplitude 3-5px
+  const pulseCount = Math.floor(randRange(4, 6));
+  const pulseSpacing = 2000; // ms of hover time between pulses
+  const pulseHoldDuration = Math.round(randRange(400, 600));
+  const pulseReturnDuration = 150;
+  const pulses = [];
+  for (let i = 0; i < pulseCount; i++) {
+    const hoverTimeMs = pulseSpacing * (i + 1) + Math.round(randRange(-200, 200));
+    const dir = (i % 3 === 2) ? -1 : 1;
+    pulses.push({
+      hoverTimeMs,
+      ampX: +(randRange(3, 5)).toFixed(1) * dir,
+      ampY: 0,
+    });
+  }
+
+  const challenge = {
+    challengeId,
+    issuedAt: now,
+    expiresAt: now + CHALLENGE_TTL_MS * 2, // Embed gets longer TTL (6 min) — users browse at their own pace
+    mode: "embed",
+    perturbation: {
+      probes,
+      pulses,
+      pulseHoldDuration,
+      pulseReturnDuration,
+    },
+    used: false,
+  };
+
+  challenges.set(challengeId, challenge);
+  return challenge;
+}
+
+/**
+ * Client params for embed mode — only what the library needs to apply perturbations.
+ */
+function embedClientParams(challenge) {
+  return {
+    challengeId: challenge.challengeId,
+    perturbation: {
+      probes: challenge.perturbation.probes,
+      pulses: challenge.perturbation.pulses,
+      pulseHoldDuration: challenge.perturbation.pulseHoldDuration,
+      pulseReturnDuration: challenge.perturbation.pulseReturnDuration,
+    },
+  };
+}
+
+
 // ─── ENDPOINT HANDLERS ──────────────────────────────────────
 
 async function handleChallenge(_req, res) {
@@ -383,6 +457,117 @@ async function handleVerify(req, res) {
 }
 
 
+// ─── EMBED ENDPOINT HANDLERS ────────────────────────────────
+
+async function handleEmbedChallenge(_req, res) {
+  const challenge = generateEmbedChallenge();
+  const token = makeToken({ challengeId: challenge.challengeId, expiresAt: challenge.expiresAt });
+
+  console.log(`[clnp-embed] Challenge ${challenge.challengeId.slice(0, 8)} created — ` +
+    `probes: [${challenge.perturbation.probes.map(p => p.freq).join(', ')}]Hz, ` +
+    `${challenge.perturbation.pulses.length} pulses (hover-time spaced)`);
+
+  json(res, 200, {
+    ok: true,
+    token,
+    challenge: embedClientParams(challenge),
+  });
+}
+
+async function handleEmbedVerify(req, res) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    json(res, 400, { ok: false, error: err.message }); return;
+  }
+
+  // Verify token
+  const tokenData = verifyToken(body.token);
+  if (!tokenData) {
+    json(res, 401, { ok: false, error: "invalid_token" }); return;
+  }
+
+  const challenge = challenges.get(tokenData.challengeId);
+  if (!challenge) {
+    json(res, 404, { ok: false, error: "challenge_not_found" }); return;
+  }
+  if (challenge.mode !== "embed") {
+    json(res, 400, { ok: false, error: "wrong_challenge_mode" }); return;
+  }
+  if (challenge.used) {
+    json(res, 409, { ok: false, error: "challenge_already_used" }); return;
+  }
+  if (Date.now() > challenge.expiresAt) {
+    challenge.used = true;
+    json(res, 410, { ok: false, error: "challenge_expired" }); return;
+  }
+
+  // Mark as used
+  challenge.used = true;
+  challenge.usedAt = Date.now();
+
+  // Validate embed raw data shape
+  if (!Array.isArray(body.pointer) || body.pointer.length < 30) {
+    json(res, 400, { ok: false, error: "insufficient_pointer_data" }); return;
+  }
+  if (!Array.isArray(body.elements) || body.elements.length < 1) {
+    json(res, 400, { ok: false, error: "missing_elements" }); return;
+  }
+
+  // Run embed analysis
+  const rawData = {
+    pointer: body.pointer,
+    accel: Array.isArray(body.accel) ? body.accel : [],
+    hovers: Array.isArray(body.hovers) ? body.hovers : [],
+    pulseLog: Array.isArray(body.pulseLog) ? body.pulseLog : [],
+    elements: body.elements,
+    inputMethod: body.inputMethod || "unknown",
+  };
+
+  let result;
+  try {
+    result = analyzeEmbed(rawData, challenge);
+  } catch (err) {
+    console.error(`[clnp-embed] Analysis error for ${challenge.challengeId.slice(0, 8)}:`, err.message);
+    json(res, 500, { ok: false, error: "analysis_failed" }); return;
+  }
+
+  // Generate signed receipt
+  const receipt = makeToken({
+    challengeId: challenge.challengeId,
+    mode: "embed",
+    verified: result.overall >= 0.60,
+    score: Number(result.overall.toFixed(3)),
+    verdict: result.verdict,
+    verifiedAt: Date.now(),
+  });
+
+  console.log(`[clnp-embed] Verify ${challenge.challengeId.slice(0, 8)} — ` +
+    `${result.verdict} (${Math.round(result.overall * 100)}%) ` +
+    `[${result.sampleCount} samples, ${result.sampleRate}Hz, ` +
+    `${result.totalHoverTime}ms hover, ${result.uniqueElements} elements, ${rawData.inputMethod}]`);
+
+  json(res, 200, {
+    ok: true,
+    challengeId: challenge.challengeId,
+    mode: "embed",
+    overall: result.overall,
+    verdict: result.verdict,
+    verdictClass: result.verdictClass,
+    scores: result.scores,
+    validCount: result.validCount,
+    sampleRate: result.sampleRate,
+    sampleCount: result.sampleCount,
+    totalHoverTime: result.totalHoverTime,
+    uniqueElements: result.uniqueElements,
+    plausible: result.plausible,
+    inputMethod: result.inputMethod,
+    receipt,
+  });
+}
+
+
 // ─── STATIC FILE SERVING ────────────────────────────────────
 
 function serveFile(res, filePath, contentType) {
@@ -421,13 +606,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Serve embed files
+  if (method === "GET" && url.pathname === "/clnp-embed.js") {
+    serveFile(res, path.join(ROOT, "clnp-embed.js"), "application/javascript; charset=utf-8");
+    return;
+  }
+  if (method === "GET" && url.pathname === "/clnp-embed-demo.html") {
+    serveFile(res, path.join(ROOT, "clnp-embed-demo.html"), "text/html; charset=utf-8");
+    return;
+  }
+
+  // Standalone API
   if (method === "POST" && url.pathname === "/api/challenge") {
     await handleChallenge(req, res);
     return;
   }
-
   if (method === "POST" && url.pathname === "/api/verify") {
     await handleVerify(req, res);
+    return;
+  }
+
+  // Embed API
+  if (method === "POST" && url.pathname === "/api/embed/challenge") {
+    await handleEmbedChallenge(req, res);
+    return;
+  }
+  if (method === "POST" && url.pathname === "/api/embed/verify") {
+    await handleEmbedVerify(req, res);
     return;
   }
 

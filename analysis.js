@@ -790,4 +790,369 @@ function analyze(rawData, challenge) {
   };
 }
 
-module.exports = { analyze };
+// ─── EMBEDDED CLNP ANALYSIS ─────────────────────────────────
+// AGENT COOKIE CRUMB: The embed mode runs invisibly during normal browsing.
+// Instead of a dedicated tracking task, micro CSS-transform perturbations
+// (1-2px sine waves, 3-5px pulses) are applied to hovered interactive elements.
+// The perturbation signal lives in CUMULATIVE HOVER TIME — not wall-clock time.
+// When the user hovers element A for 2s, leaves, hovers element B for 3s,
+// the perturbation is continuous at t=0→5s. This preserves FFT coherence.
+// The "target" position is the hovered element's center. 7/8 metrics run
+// (cognitive-motor interference is dropped since there's no explicit task).
+
+/**
+ * Device-aware embed scoring weights. SECRET: these never leave the server.
+ *
+ * AGENT COOKIE CRUMB: Three device profiles with different weight distributions.
+ * The SAME analysis pipelines run for all devices, but scoring adjusts because:
+ *
+ *   TOUCH (phone/tablet):
+ *     - Min-jerk weight = 0. On touch, the finger stays on the screen and the
+ *       element moves under it via CSS transform. There's no corrective cursor
+ *       movement, so the 5th-order polynomial fit produces R²≈0. Not a signal.
+ *     - Cross-axis weight boosted. Touch has rich cross-axis coupling from
+ *       fat-finger mechanics — a strong biological indicator.
+ *     - Tremor weight boosted. Accelerometer tremor is the strongest touch signal.
+ *
+ *   TRACKPAD (laptop):
+ *     - All 7 metrics active. Trackpad produces different tremor than mouse
+ *       (finger-on-surface vs wrist-pivot) but min-jerk still works.
+ *     - Min-jerk slightly lower weight — trackpad corrections are less ballistic.
+ *
+ *   MOUSE (desktop):
+ *     - All 7 metrics at full weight. This is the optimal input device for CLNP.
+ *     - Min-jerk is a strong signal — wrist corrections follow minimum-jerk trajectory.
+ */
+const EmbedScoringConfig = {
+  // Per-device weight profiles
+  mouse: {
+    transferFn: 3.0,
+    tremor: 2.5,
+    oneOverF: 2.0,
+    signalDepNoise: 2.5,
+    crossAxis: 2.0,
+    pulseResponse: 3.0,
+    minJerk: 2.0,
+  },
+  trackpad: {
+    transferFn: 3.0,
+    tremor: 2.5,
+    oneOverF: 2.0,
+    signalDepNoise: 2.5,
+    crossAxis: 2.0,
+    pulseResponse: 3.0,
+    minJerk: 1.0,     // Trackpad corrections less ballistic than mouse
+  },
+  touch: {
+    transferFn: 3.0,
+    tremor: 3.0,       // Boosted: accel tremor is strong on mobile
+    oneOverF: 2.0,
+    signalDepNoise: 2.5,
+    crossAxis: 3.0,    // Boosted: fat-finger coupling is rich signal
+    pulseResponse: 3.0,
+    minJerk: 0,        // Disabled: no corrective trajectory on touch
+  },
+
+  // Verdict thresholds (same for all devices — metrics are normalized)
+  humanThreshold: 0.60,
+  uncertainThreshold: 0.30,
+};
+
+/**
+ * Compute perturbation at a given cumulative hover time.
+ * Same physics as standalone but in hover-time domain (not wall-clock).
+ *
+ * @param {number} hoverT - Cumulative hover time in ms
+ * @param {Array} probes - [{freq, ampX, ampY, phaseOffset}, ...]
+ * @param {Array} pulses - [{hoverTimeMs, ampX, ampY}, ...]
+ * @param {number} pulseHoldDuration - ms to hold pulse displacement
+ * @param {number} pulseReturnDuration - ms for ease-back after hold
+ */
+function computeEmbedPerturbation(hoverT, probes, pulses, pulseHoldDuration, pulseReturnDuration) {
+  let px = 0, py = 0;
+  let isPulse = false;
+  let pulseIndex = -1;
+
+  // Multi-sine component — continuous in hover-time domain
+  const elapsed = hoverT / 1000;
+  for (const probe of probes) {
+    const phase = 2 * Math.PI * probe.freq * elapsed;
+    px += probe.ampX * Math.sin(phase);
+    py += probe.ampY * Math.sin(phase + probe.phaseOffset);
+  }
+
+  // Pulse component — pulse times are in hover-time domain
+  for (let i = 0; i < pulses.length; i++) {
+    const pulse = pulses[i];
+    if (hoverT < pulse.hoverTimeMs) continue;
+    const dt = hoverT - pulse.hoverTimeMs;
+    if (dt < pulseHoldDuration) {
+      px += pulse.ampX;
+      py += pulse.ampY;
+      isPulse = true;
+      pulseIndex = i;
+    } else if (dt < pulseHoldDuration + pulseReturnDuration) {
+      const frac = (dt - pulseHoldDuration) / pulseReturnDuration;
+      const ease = 1 - frac * frac;
+      px += pulse.ampX * ease;
+      py += pulse.ampY * ease;
+    }
+  }
+
+  return { x: px, y: py, isPulse, pulseIndex };
+}
+
+/**
+ * Reconstruct tracking data from embed pointer samples.
+ * Element center = target position. Perturbation computed in hover-time domain.
+ * Output format matches standalone tracking for pipeline reuse.
+ *
+ * @param {Array} pointer - [[wallTime, hoverTime, x, y, elementIndex], ...]
+ * @param {Array} elements - [{ index, rect: { x, y, w, h } }, ...]
+ * @param {Object} challenge - Server-stored embed challenge params
+ * @returns {Array} tracking - [{ t, wallTime, x, y, targetX, targetY, pertX, pertY, isPulse, pulseIdx }, ...]
+ */
+function reconstructEmbedTracking(pointer, elements, challenge) {
+  const { perturbation } = challenge;
+  const tracking = [];
+
+  // Build element center lookup: index → { cx, cy }
+  const elemCenters = {};
+  for (const el of elements) {
+    elemCenters[el.index] = {
+      x: el.rect.x + el.rect.w / 2,
+      y: el.rect.y + el.rect.h / 2,
+    };
+  }
+
+  for (const [wallTime, hoverTime, x, y, elementIndex] of pointer) {
+    const center = elemCenters[elementIndex];
+    if (!center) continue;
+
+    const pert = computeEmbedPerturbation(
+      hoverTime,
+      perturbation.probes,
+      perturbation.pulses,
+      perturbation.pulseHoldDuration,
+      perturbation.pulseReturnDuration
+    );
+
+    tracking.push({
+      t: hoverTime,       // Continuous hover-time domain for FFT coherence
+      wallTime,           // Preserved for plausibility checks
+      x, y,               // Raw cursor position
+      targetX: center.x + pert.x,  // Element center + perturbation
+      targetY: center.y + pert.y,
+      pertX: pert.x,
+      pertY: pert.y,
+      isPulse: pert.isPulse,
+      pulseIdx: pert.pulseIndex,
+    });
+  }
+
+  return tracking;
+}
+
+/**
+ * Score 7 embed metrics (no cognitive task) with device-aware weights.
+ * Selects weight profile based on inputMethod ('touch' | 'trackpad' | 'mouse').
+ */
+function scoreEmbedResults(results, inputMethod) {
+  const scores = {};
+  let weightedSum = 0, totalWeight = 0, validCount = 0;
+  // Select device-specific weight profile; fall back to mouse if unknown
+  const W = EmbedScoringConfig[inputMethod] || EmbedScoringConfig.mouse;
+
+  // 1. Transfer Function
+  if (results.transferFn && results.transferFn.valid) {
+    const tf = results.transferFn;
+    let s = 0;
+    if (tf.hasRolloff) s += 0.7;
+    if (tf.hasPhaseDelay) s += 0.15;
+    if (tf.delayPlausible) s += 0.15;
+    s = Math.min(1, s);
+    const delayStr = tf.meanDelay !== null ? `${tf.meanDelay.toFixed(0)}ms` : 'N/A';
+    scores.transferFn = { score: s, weight: W.transferFn, label: 'Transfer Function',
+      detail: `Gain rolloff: ${tf.hasRolloff ? 'YES' : 'NO'}, Est. delay: ${delayStr} (${tf.coherentProbeCount} coherent probes)` };
+    weightedSum += s * W.transferFn; totalWeight += W.transferFn; validCount++;
+  }
+
+  // 2. Physiological Tremor (cursor + accelerometer hybrid)
+  {
+    const hasCursor = results.tremor && results.tremor.valid;
+    const hasAccel = results.accelTremor && results.accelTremor.valid;
+    if (hasCursor || hasAccel) {
+      let cursorScore = 0, cursorDetail = '';
+      if (hasCursor) {
+        const tr = results.tremor;
+        cursorScore = Math.min(1, tr.tremorRatio / (ScoringConfig.humanTremorRatioMin * 3));
+        if (tr.peakFrequency >= 7 && tr.peakFrequency <= 13) cursorScore = Math.min(1, cursorScore + 0.2);
+        cursorDetail = `Cursor: ${(tr.tremorRatio * 100).toFixed(2)}%@${tr.peakFrequency.toFixed(1)}Hz`;
+      }
+      let accelScore = 0, accelDetail = '';
+      if (hasAccel) {
+        const at = results.accelTremor;
+        accelScore = Math.min(1, at.tremorRatio / (ScoringConfig.humanTremorRatioMin * 3));
+        if (at.peakFrequency >= 7 && at.peakFrequency <= 13) accelScore = Math.min(1, accelScore + 0.2);
+        accelDetail = `Accel: ${(at.tremorRatio * 100).toFixed(2)}%@${at.peakFrequency.toFixed(1)}Hz (${at.sampleCount} samples, ${Math.round(at.sampleRate)}Hz)`;
+      }
+      const s = Math.max(cursorScore, accelScore);
+      const source = accelScore > cursorScore ? 'accelerometer' : 'cursor';
+      const detail = [cursorDetail, accelDetail].filter(Boolean).join(' | ') + ` [best: ${source}]`;
+      scores.tremor = { score: s, weight: W.tremor, label: 'Physiological Tremor', detail };
+      weightedSum += s * W.tremor; totalWeight += W.tremor; validCount++;
+    }
+  }
+
+  // 3. 1/f Noise
+  if (results.oneOverF && results.oneOverF.valid) {
+    const s = rangeScore(results.oneOverF.slope, ScoringConfig.human1fSlopeRange[0], ScoringConfig.human1fSlopeRange[1], 3);
+    scores.oneOverF = { score: s, weight: W.oneOverF, label: '1/f Noise Structure',
+      detail: `Velocity-domain slope: ${results.oneOverF.slope.toFixed(2)}, R²: ${results.oneOverF.r2.toFixed(2)}` };
+    weightedSum += s * W.oneOverF; totalWeight += W.oneOverF; validCount++;
+  }
+
+  // 4. Signal-Dependent Noise
+  if (results.signalDepNoise && results.signalDepNoise.valid) {
+    const s = Math.max(0, Math.min(1, results.signalDepNoise.correlation / 0.4));
+    scores.signalDepNoise = { score: s, weight: W.signalDepNoise, label: 'Signal-Dependent Noise',
+      detail: `Correlation: ${results.signalDepNoise.correlation.toFixed(3)}, Slope: ${results.signalDepNoise.slope.toFixed(4)}` };
+    weightedSum += s * W.signalDepNoise; totalWeight += W.signalDepNoise; validCount++;
+  }
+
+  // 5. Cross-Axis Coupling (touch-adjusted)
+  if (results.crossAxis && results.crossAxis.valid) {
+    const ca = results.crossAxis;
+    const isTouch = inputMethod === 'touch';
+    const idealMax = isTouch ? 8 : 2;
+    const scoreDenom = isTouch ? 1.0 : 0.3;
+    const s = Math.min(1, ca.meanCoupling / scoreDenom) * (ca.meanCoupling < idealMax ? 1 : 0.5);
+    scores.crossAxis = { score: s, weight: W.crossAxis, label: 'Cross-Axis Coupling',
+      detail: `Mean coupling: ${ca.meanCoupling.toFixed(3)}${isTouch ? ' [touch-adjusted]' : ''}` };
+    weightedSum += s * W.crossAxis; totalWeight += W.crossAxis; validCount++;
+  }
+
+  // 6. Pulse Response Latency
+  if (results.pulseResponse && results.pulseResponse.valid) {
+    const pr = results.pulseResponse;
+    const latScore = rangeScore(pr.latencyMean, ScoringConfig.humanLatencyRange[0], ScoringConfig.humanLatencyRange[1], 0.03);
+    const varScore = rangeScore(pr.latencyStd, ScoringConfig.humanLatencySD[0], ScoringConfig.humanLatencySD[1], 0.08);
+    const s = latScore * 0.6 + varScore * 0.4;
+    const detected = pr.responses.filter(r => r.latency !== null).length;
+    scores.pulseResponse = { score: s, weight: W.pulseResponse, label: 'Response Latency',
+      detail: `Mean: ${pr.latencyMean.toFixed(0)}ms (σ=${pr.latencyStd.toFixed(0)}ms), ${detected}/${pr.responses.length} pulses detected` };
+    weightedSum += s * W.pulseResponse; totalWeight += W.pulseResponse; validCount++;
+  }
+
+  // 7. Minimum Jerk — skipped when weight=0 (touch: no corrective trajectory)
+  if (W.minJerk > 0 && results.minJerk && results.minJerk.valid) {
+    const s = Math.min(1, Math.max(0, results.minJerk.meanR2 / 0.6));
+    scores.minJerk = { score: s, weight: W.minJerk, label: 'Minimum Jerk Trajectory',
+      detail: `Mean R²: ${results.minJerk.meanR2.toFixed(3)} (≥0.6 = strong biological match)` };
+    weightedSum += s * W.minJerk; totalWeight += W.minJerk; validCount++;
+  }
+
+  const overall = totalWeight > 0 ? weightedSum / totalWeight : 0;
+  let verdict, verdictClass;
+  if (overall >= EmbedScoringConfig.humanThreshold) {
+    verdict = 'BIOLOGICAL CONTROLLER DETECTED'; verdictClass = 'score-human';
+  } else if (overall >= EmbedScoringConfig.uncertainThreshold) {
+    verdict = 'UNCERTAIN — INCONCLUSIVE SIGNALS'; verdictClass = 'score-uncertain';
+  } else {
+    verdict = 'NON-BIOLOGICAL CONTROLLER SUSPECTED'; verdictClass = 'score-bot';
+  }
+
+  return { overall, scores, validCount, verdict, verdictClass };
+}
+
+
+/**
+ * Run embedded CLNP analysis on raw browsing data.
+ *
+ * AGENT COOKIE CRUMB: This is the embed-mode counterpart of analyze().
+ * Key differences from standalone:
+ *   1. Target = element center (not Lissajous path)
+ *   2. Time domain = cumulative hover time (not wall clock)
+ *   3. 7 metrics (no cognitive-motor interference)
+ *   4. Pulses defined by hoverTimeMs (not offsetMs from tracking start)
+ *
+ * We map embed data to the same format the existing analysis functions expect,
+ * then call them with trackingStart=0 and pulse.offsetMs=pulse.hoverTimeMs.
+ * This avoids duplicating analysis logic.
+ *
+ * @param {Object} rawData - Client-submitted embed data
+ *   @param {Array} rawData.pointer - [[wallTime, hoverTime, x, y, elementIndex], ...]
+ *   @param {Array} rawData.accel - [[wallTime, ax, ay, az], ...] (optional)
+ *   @param {Array} rawData.hovers - [[elemIdx, startWall, endWall, startHover, endHover], ...]
+ *   @param {Array} rawData.pulseLog - [[hoverTime, wallTime, dx, dy, elementIndex], ...]
+ *   @param {Array} rawData.elements - [{ index, rect: {x, y, w, h} }, ...]
+ *   @param {string} rawData.inputMethod - 'mouse' | 'touch' | 'trackpad'
+ *
+ * @param {Object} challenge - Server-stored embed challenge parameters
+ *
+ * @returns {Object} { overall, scores, verdict, verdictClass, validCount, sampleRate, sampleCount }
+ */
+function analyzeEmbed(rawData, challenge) {
+  // 1. Reconstruct tracking data from hover pointer samples + element positions
+  const tracking = reconstructEmbedTracking(rawData.pointer, rawData.elements, challenge);
+
+  if (tracking.length < 50) {
+    return { overall: 0, scores: {}, verdict: 'INSUFFICIENT DATA', verdictClass: 'score-bot', validCount: 0 };
+  }
+
+  // 2. Estimate sample rate from hover-time domain
+  const dts = [];
+  for (let i = 1; i < Math.min(tracking.length, 500); i++) {
+    const dt = tracking[i].t - tracking[i - 1].t;
+    if (dt > 0 && dt < 100) dts.push(dt); // Skip gaps between hover periods
+  }
+  const sampleRate = dts.length > 0 ? 1000 / (dts.reduce((a, b) => a + b, 0) / dts.length) : 60;
+
+  // 3. Extract probe frequencies
+  const probeFreqs = challenge.perturbation.probes.map(p => p.freq);
+
+  // 4. Map embed pulses to standalone pulse format for pipeline reuse.
+  // Standalone expects pulse.offsetMs relative to trackingStart.
+  // Since our tracking uses hoverTime starting from 0, we set trackingStart=0
+  // and offsetMs=hoverTimeMs. This makes absTime = 0 + hoverTimeMs = hoverTimeMs,
+  // which matches tracking[i].t (hoverTime). Zero-cost format adapter.
+  const mappedPulses = challenge.perturbation.pulses.map(p => ({
+    offsetMs: p.hoverTimeMs,
+    ampX: p.ampX,
+    ampY: p.ampY,
+  }));
+  const trackingStartZero = 0; // hover-time domain starts at 0
+
+  // 5. Run 7 analyses (no cognitive-motor interference)
+  const results = {};
+  results.transferFn = analyzeTransferFunction(tracking, sampleRate, probeFreqs);
+  results.tremor = analyzeTremor(tracking, sampleRate);
+  results.accelTremor = analyzeAccelTremor(rawData.accel);
+  results.oneOverF = analyze1fNoise(tracking, sampleRate);
+  results.signalDepNoise = analyzeSignalDepNoise(tracking);
+  results.crossAxis = analyzeCrossAxis(tracking, mappedPulses, trackingStartZero);
+  results.pulseResponse = analyzePulseResponses(tracking, mappedPulses, trackingStartZero);
+  results.minJerk = analyzeMinJerk(results.pulseResponse);
+
+  // 6. Score with embed weights (no cognitive metric)
+  const scoreResult = scoreEmbedResults(results, rawData.inputMethod);
+
+  // 7. Plausibility checks on hover data
+  let plausible = true;
+  const totalHoverTime = tracking.length > 0 ? tracking[tracking.length - 1].t - tracking[0].t : 0;
+  if (totalHoverTime < 3000) plausible = false; // Less than 3s hover is suspicious
+  const uniqueElements = new Set(rawData.pointer.map(p => p[4])).size;
+  if (uniqueElements < 1) plausible = false;
+
+  return {
+    ...scoreResult,
+    sampleRate: Math.round(sampleRate),
+    sampleCount: tracking.length,
+    inputMethod: rawData.inputMethod,
+    totalHoverTime: Math.round(totalHoverTime),
+    uniqueElements,
+    plausible,
+  };
+}
+
+module.exports = { analyze, analyzeEmbed };
