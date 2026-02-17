@@ -452,7 +452,7 @@ body {
   <!-- Computing -->
   <div id="computing">
     <div class="spinner"></div>
-    <div style="color:var(--text-dim); font-size:0.85rem;">Analyzing neuromechanical signatures...</div>
+    <div id="computingText" style="color:var(--text-dim); font-size:0.85rem;">Verifying with server...</div>
   </div>
 
   <!-- Results -->
@@ -473,23 +473,31 @@ body {
 <script>
 /* ==================================================================
  * CLNP — Closed-Loop Neuromechanical Probing
- * Proof-of-Concept Implementation
+ * Proof-of-Concept Implementation (Client-Side Renderer)
  *
  * AGENT COOKIE CRUMB — Architecture Overview:
- * This file is organized into discrete modules (as IIFEs/objects):
+ * The client collects raw pointer/accel data and renders the tracking
+ * task. The server generates randomized challenges (probe frequencies,
+ * pulse schedule, cog task), analyzes submitted data with secret scoring
+ * thresholds, and returns a verdict. This split prevents bots from
+ * inspecting scoring logic in client-side JS.
  *
- *   1. Config         – All tunable parameters in one place
- *   2. MathEngine     – FFT, statistics, spectral analysis, fitting
- *   3. PerturbEngine  – Generates multi-sine + pulse perturbation signals
- *   4. TargetPath     – Smooth Lissajous figure for tracking
- *   5. DataStore      – High-resolution event recording
- *   6. Collector      – Pointer event listeners, max-resolution capture
- *   7. Analyzer       – All 8 analysis pipelines
- *   8. Scorer         – Model-based scoring (not ML-based)
- *   9. Renderer       – Canvas drawing for tracking task + result charts
- *  10. PhaseCtrl      – State machine for test phases
- *  11. CogTask        – Cognitive-motor dual-task flash system
- *  12. Init           – Bootstrap and event wiring
+ * Modules in this file:
+ *
+ *   1. Config         – Server URL + challenge params (populated at runtime)
+ *   2. PerturbEngine  – Renders perturbation signals from server-provided params
+ *   3. TargetPath     – Smooth Lissajous figure from server-provided params
+ *   4. DataStore      – High-resolution event recording
+ *   5. Collector      – Pointer event listeners, max-resolution capture
+ *   6. Renderer       – Canvas drawing for tracking task + result charts
+ *   7. ServerAPI      – Fetch challenge + submit verification to server
+ *   8. CogTask        – Cognitive-motor dual-task flash system (server schedule)
+ *   9. PhaseCtrl      – State machine for test phases + server communication
+ *  10. Init           – Bootstrap and event wiring
+ *
+ * Server-side modules (NOT in this file):
+ *   - analysis.js     – FFT, 8 analysis pipelines, scoring with secret thresholds
+ *   - server.js       – HTTP endpoints: POST /api/challenge, POST /api/verify
  *
  * Novel concept: Instead of training a classifier (data flywheel),
  * we test whether observed motor responses are PHYSICALLY PLAUSIBLE
@@ -498,343 +506,63 @@ body {
 
 // ─────────────────────────────────────────────
 // 1. CONFIGURATION
+// AGENT COOKIE CRUMB: Config now holds only a reference to
+// server-provided challenge parameters. All scoring thresholds
+// have moved to analysis.js (server-side only). Rendering defaults
+// and probe frequencies are generated per-session by the server.
 // ─────────────────────────────────────────────
 const Config = {
-  // Phase durations (ms)
-  freeMoveDuration: 5000,
-  trackingDuration: 20000,
-  dualTaskDuration: 12000,
+  // Server-provided challenge (populated by ServerAPI.fetchChallenge)
+  challenge: null,
+  token: null,
 
-  // Target path: Lissajous parameters
-  // Slow enough to follow, complex enough to require continuous control
-  pathFreqX: 0.15,   // Hz
-  pathFreqY: 0.10,   // Hz
-  pathPhase: Math.PI / 4,
-  pathPadding: 0.30,  // fraction of canvas for amplitude
-
-  // Multi-sine perturbation probe frequencies (Hz)
-  // Non-harmonic to avoid spectral leakage between probes
-  probeFreqs: [0.7, 1.5, 2.8, 4.3, 7.1],
-  probeAmps:  [4,   5,   6,   6,   5  ],  // pixels
-
-  // Pulse perturbations
-  pulseCount: 6,
-  pulseAmp: 22,           // pixels, X-direction only
-  pulseMinGap: 2800,      // ms between pulses
-  pulseHoldDuration: 600, // ms before smooth return
-  pulseReturnDuration: 200,
-
-  // Cognitive flash
-  // AGENT COOKIE CRUMB: Target count and color are randomized each run
-  // to prevent bots from hardcoding the answer. The target color and
-  // count are determined at schedule generation time.
-  cogFlashCount: 8,
-  cogFlashDuration: 400,  // ms visible
-  cogFlashGap: 1200,      // minimum ms between flashes
-  cogTargetColors: ['#ff4444', '#4488ff', '#00e87b'],  // possible target colors
-  cogTargetColorNames: ['RED', 'BLUE', 'GREEN'],       // display names
-
-  // Analysis parameters
-  tremorBandLow: 8,       // Hz
-  tremorBandHigh: 12,     // Hz
-  sampleRateTarget: 60,   // assumed minimum sample rate (Hz)
-
-  // Scoring thresholds (derived from motor control literature)
-  // AGENT COOKIE CRUMB: These are based on established biomechanics:
-  //  - Response latency: visual feedback loop ~150-300ms
-  //  - Tremor ratio: healthy adults show measurable 8-12Hz power
-  //  - 1/f slope: biological systems produce pink noise (slope ≈ -1)
-  //  - Signal-dep noise: Harris & Wolpert 1998, variability ∝ signal magnitude
-  //  - Cross-axis coupling: forearm biomechanics cause X→Y coupling
-  humanLatencyRange: [120, 380],   // ms
-  humanLatencySD: [15, 180],       // ms (too consistent = bot; trackpads produce high variance)
-  humanTremorRatioMin: 0.005,
-  human1fSlopeRange: [-2.5, 0.0],   // velocity-domain slope; position slope is ~1 steeper
-  humanSDNSlopeMin: 0.05,
-  humanCrossAxisMin: 0.03,
-  humanCogInterferenceMin: 0.03,
-};
-
-// ─────────────────────────────────────────────
-// 2. MATH ENGINE
-// AGENT COOKIE CRUMB: Pure math utilities.
-// FFT is radix-2 Cooley-Tukey. All spectral
-// analysis builds on this.
-// ─────────────────────────────────────────────
-const MathEngine = {
-
-  nextPow2(n) {
-    let p = 1;
-    while (p < n) p <<= 1;
-    return p;
-  },
-
-  /**
-   * Radix-2 Cooley-Tukey FFT
-   * @param {number[]} re - real part
-   * @param {number[]} im - imaginary part (same length, can be zeros)
-   * @returns {{ re: number[], im: number[] }}
-   */
-  fft(re, im) {
-    const N = re.length;
-    if (N <= 1) return { re: [...re], im: [...im] };
-
-    // Bit-reversal permutation
-    const outRe = new Float64Array(N);
-    const outIm = new Float64Array(N);
-    const bits = Math.log2(N);
-    for (let i = 0; i < N; i++) {
-      let rev = 0;
-      for (let b = 0; b < bits; b++) {
-        rev = (rev << 1) | ((i >> b) & 1);
-      }
-      outRe[rev] = re[i];
-      outIm[rev] = im[i];
-    }
-
-    // Butterfly operations
-    for (let size = 2; size <= N; size *= 2) {
-      const half = size / 2;
-      const angle = -2 * Math.PI / size;
-      for (let i = 0; i < N; i += size) {
-        for (let j = 0; j < half; j++) {
-          const wRe = Math.cos(angle * j);
-          const wIm = Math.sin(angle * j);
-          const tRe = wRe * outRe[i + j + half] - wIm * outIm[i + j + half];
-          const tIm = wRe * outIm[i + j + half] + wIm * outRe[i + j + half];
-          outRe[i + j + half] = outRe[i + j] - tRe;
-          outIm[i + j + half] = outIm[i + j] - tIm;
-          outRe[i + j] += tRe;
-          outIm[i + j] += tIm;
-        }
-      }
-    }
-    return { re: Array.from(outRe), im: Array.from(outIm) };
-  },
-
-  /** Power spectral density from real signal */
-  psd(signal, sampleRate) {
-    const N = this.nextPow2(signal.length);
-    const re = new Array(N).fill(0);
-    const im = new Array(N).fill(0);
-    // Apply Hanning window to reduce spectral leakage
-    for (let i = 0; i < signal.length; i++) {
-      const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (signal.length - 1)));
-      re[i] = signal[i] * w;
-    }
-    const spec = this.fft(re, im);
-    const halfN = N / 2;
-    const freqs = [];
-    const power = [];
-    for (let i = 0; i < halfN; i++) {
-      freqs.push(i * sampleRate / N);
-      power.push((spec.re[i] ** 2 + spec.im[i] ** 2) / N);
-    }
-    return { freqs, power };
-  },
-
-  /**
-   * Transfer function estimation via cross-spectral method
-   * H(f) = Sxy(f) / Sxx(f)
-   * Coherence γ²(f) = |Sxy|² / (Sxx · Syy)
-   *
-   * AGENT COOKIE CRUMB: This is the CORE of the novel detection.
-   * We inject known perturbation signals (input) and measure cursor
-   * response (output). The transfer function reveals the dynamical
-   * properties of the controller. Biological systems have specific
-   * gain rolloff, phase delay, and resonance that bots cannot fake.
-   */
-  transferFunction(input, output, sampleRate) {
-    const N = this.nextPow2(Math.max(input.length, output.length));
-    const xRe = new Array(N).fill(0);
-    const xIm = new Array(N).fill(0);
-    const yRe = new Array(N).fill(0);
-    const yIm = new Array(N).fill(0);
-
-    // Hanning window
-    const len = Math.min(input.length, output.length);
-    for (let i = 0; i < len; i++) {
-      const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (len - 1)));
-      xRe[i] = input[i] * w;
-      yRe[i] = output[i] * w;
-    }
-
-    const X = this.fft(xRe, xIm);
-    const Y = this.fft(yRe, yIm);
-    const halfN = N / 2;
-
-    const magnitude = [];
-    const phase = [];
-    const coherence = [];
-    const freqs = [];
-
-    for (let i = 0; i < halfN; i++) {
-      freqs.push(i * sampleRate / N);
-
-      // Sxy = conj(X) * Y
-      const sxyRe = X.re[i] * Y.re[i] + X.im[i] * Y.im[i];
-      const sxyIm = X.re[i] * Y.im[i] - X.im[i] * Y.re[i];
-
-      // Sxx = |X|²
-      const sxx = X.re[i] ** 2 + X.im[i] ** 2 + 1e-12;
-      // Syy = |Y|²
-      const syy = Y.re[i] ** 2 + Y.im[i] ** 2 + 1e-12;
-
-      // H = Sxy / Sxx
-      const hRe = sxyRe / sxx;
-      const hIm = sxyIm / sxx;
-      magnitude.push(Math.sqrt(hRe ** 2 + hIm ** 2));
-      phase.push(Math.atan2(hIm, hRe));
-
-      // Coherence
-      const sxyMag2 = sxyRe ** 2 + sxyIm ** 2;
-      coherence.push(sxyMag2 / (sxx * syy));
-    }
-
-    return { freqs, magnitude, phase, coherence };
-  },
-
-  /** Basic statistics */
-  stats(arr) {
-    if (!arr.length) return { mean: 0, std: 0, min: 0, max: 0 };
-    const n = arr.length;
-    const mean = arr.reduce((a, b) => a + b, 0) / n;
-    const variance = arr.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
-    return {
-      mean,
-      std: Math.sqrt(variance),
-      min: Math.min(...arr),
-      max: Math.max(...arr),
-    };
-  },
-
-  /** Linear regression: returns { slope, intercept, r2 } */
-  linReg(xs, ys) {
-    const n = xs.length;
-    if (n < 2) return { slope: 0, intercept: 0, r2: 0 };
-    let sx = 0, sy = 0, sxy = 0, sxx = 0, syy = 0;
-    for (let i = 0; i < n; i++) {
-      sx += xs[i]; sy += ys[i];
-      sxy += xs[i] * ys[i];
-      sxx += xs[i] ** 2;
-      syy += ys[i] ** 2;
-    }
-    const denom = n * sxx - sx * sx;
-    if (Math.abs(denom) < 1e-12) return { slope: 0, intercept: 0, r2: 0 };
-    const slope = (n * sxy - sx * sy) / denom;
-    const intercept = (sy - slope * sx) / n;
-    const ssRes = ys.reduce((a, y, i) => a + (y - (slope * xs[i] + intercept)) ** 2, 0);
-    const ssTot = ys.reduce((a, y) => a + (y - sy / n) ** 2, 0);
-    const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
-    return { slope, intercept, r2 };
-  },
-
-  /** Pearson correlation coefficient */
-  correlation(xs, ys) {
-    const n = Math.min(xs.length, ys.length);
-    if (n < 3) return 0;
-    const mx = xs.reduce((a, b) => a + b, 0) / n;
-    const my = ys.reduce((a, b) => a + b, 0) / n;
-    let num = 0, dx2 = 0, dy2 = 0;
-    for (let i = 0; i < n; i++) {
-      const dx = xs[i] - mx;
-      const dy = ys[i] - my;
-      num += dx * dy;
-      dx2 += dx * dx;
-      dy2 += dy * dy;
-    }
-    const denom = Math.sqrt(dx2 * dy2);
-    return denom > 0 ? num / denom : 0;
-  },
-
-  /** Compute velocity from position time series */
-  velocity(positions, timestamps) {
-    const vel = [];
-    for (let i = 1; i < positions.length; i++) {
-      const dt = (timestamps[i] - timestamps[i - 1]) / 1000;
-      if (dt > 0) {
-        vel.push((positions[i] - positions[i - 1]) / dt);
-      }
-    }
-    return vel;
-  },
-
-  /** Resample irregular time series to uniform rate */
-  resample(values, timestamps, targetRate) {
-    if (values.length < 2) return { values: [...values], timestamps: [...timestamps] };
-    const t0 = timestamps[0];
-    const tEnd = timestamps[timestamps.length - 1];
-    const dt = 1000 / targetRate;
-    const out = [];
-    const outT = [];
-    let srcIdx = 0;
-    for (let t = t0; t <= tEnd; t += dt) {
-      while (srcIdx < timestamps.length - 2 && timestamps[srcIdx + 1] < t) srcIdx++;
-      const t1 = timestamps[srcIdx];
-      const t2 = timestamps[srcIdx + 1] || t1 + 1;
-      const frac = (t2 > t1) ? (t - t1) / (t2 - t1) : 0;
-      const val = values[srcIdx] + frac * ((values[srcIdx + 1] || values[srcIdx]) - values[srcIdx]);
-      out.push(val);
-      outT.push(t);
-    }
-    return { values: out, timestamps: outT };
-  },
+  // Server URL (same-origin default; override for development)
+  serverUrl: '',
 };
 
 
 // ─────────────────────────────────────────────
-// 3. PERTURBATION ENGINE
+// 2. PERTURBATION ENGINE
 // AGENT COOKIE CRUMB: Generates the known
 // input signals we inject to probe the human's
-// transfer function. Multi-sine for frequency
-// response, pulses for transient analysis.
+// transfer function. Now uses server-provided
+// challenge params instead of local Config.
+// The server randomizes probe frequencies,
+// amplitudes, pulse timing, and hold/return
+// durations for each session.
 // ─────────────────────────────────────────────
 const PerturbEngine = {
   pulseSchedule: [],
   _trackingStart: 0,
 
-  /** Initialize pulse schedule with randomized timing */
-  initPulses(startTime, duration) {
-    this._trackingStart = startTime;
-    this.pulseSchedule = [];
-    const gap = Config.pulseMinGap;
-    const available = duration - gap;
-    const count = Config.pulseCount;
+  // AGENT COOKIE CRUMB: Now uses server-provided challenge params.
+  // The server randomizes probe frequencies, amplitudes, pulse timing,
+  // and hold/return durations for each session.
 
-    // Distribute pulses with minimum gap constraint
-    const slots = [];
-    for (let i = 0; i < count; i++) {
-      slots.push(gap + Math.random() * (available - (count - 1) * gap) / count + i * (available / count));
-    }
-    // Alternate directions: mostly +X, a couple -X
-    for (let i = 0; i < count; i++) {
-      const dir = (i % 3 === 2) ? -1 : 1;
-      this.pulseSchedule.push({
-        time: startTime + slots[i],
-        ampX: Config.pulseAmp * dir,
-        ampY: 0,  // X-only for cross-axis analysis
-        active: false,
-        triggered: false,
-      });
-    }
+  initPulses(startTime) {
+    this._trackingStart = startTime;
+    const pert = Config.challenge.perturbation;
+    this.pulseSchedule = pert.pulses.map(p => ({
+      time: startTime + p.offsetMs,
+      ampX: p.ampX,
+      ampY: p.ampY,
+      active: false,
+      triggered: false,
+    }));
   },
 
-  /**
-   * Get total perturbation at time t
-   * Returns { x, y, isPulse, pulseIndex }
-   */
   get(t) {
     let px = 0, py = 0;
     let isPulse = false;
     let pulseIndex = -1;
-
-    // Multi-sine component (always active during tracking)
+    const pert = Config.challenge.perturbation;
     const elapsed = (t - this._trackingStart) / 1000;
-    for (let i = 0; i < Config.probeFreqs.length; i++) {
-      const phase = 2 * Math.PI * Config.probeFreqs[i] * elapsed;
-      px += Config.probeAmps[i] * Math.sin(phase);
-      // Y-axis gets different phase offset for cross-axis analysis
-      py += Config.probeAmps[i] * 0.3 * Math.sin(phase + Math.PI / 3);
+
+    // Multi-sine from server-provided probes
+    for (const probe of pert.probes) {
+      const phase = 2 * Math.PI * probe.freq * elapsed;
+      px += probe.ampX * Math.sin(phase);
+      py += probe.ampY * Math.sin(phase + probe.phaseOffset);
     }
 
     // Pulse component
@@ -846,16 +574,14 @@ const PerturbEngine = {
       }
       if (pulse.active) {
         const dt = t - pulse.time;
-        if (dt < Config.pulseHoldDuration) {
-          // Hold phase: full perturbation
+        if (dt < pert.pulseHoldDuration) {
           px += pulse.ampX;
           py += pulse.ampY;
           isPulse = true;
           pulseIndex = i;
-        } else if (dt < Config.pulseHoldDuration + Config.pulseReturnDuration) {
-          // Smooth return phase
-          const frac = (dt - Config.pulseHoldDuration) / Config.pulseReturnDuration;
-          const ease = 1 - frac * frac; // quadratic ease-out
+        } else if (dt < pert.pulseHoldDuration + pert.pulseReturnDuration) {
+          const frac = (dt - pert.pulseHoldDuration) / pert.pulseReturnDuration;
+          const ease = 1 - frac * frac;
           px += pulse.ampX * ease;
           py += pulse.ampY * ease;
         } else {
@@ -863,18 +589,17 @@ const PerturbEngine = {
         }
       }
     }
-
     return { x: px, y: py, isPulse, pulseIndex };
   },
 
-  /** Extract just the multi-sine component at time t */
   getMultiSine(t) {
+    const pert = Config.challenge.perturbation;
     const elapsed = (t - this._trackingStart) / 1000;
     let px = 0, py = 0;
-    for (let i = 0; i < Config.probeFreqs.length; i++) {
-      const phase = 2 * Math.PI * Config.probeFreqs[i] * elapsed;
-      px += Config.probeAmps[i] * Math.sin(phase);
-      py += Config.probeAmps[i] * 0.3 * Math.sin(phase + Math.PI / 3);
+    for (const probe of pert.probes) {
+      const phase = 2 * Math.PI * probe.freq * elapsed;
+      px += probe.ampX * Math.sin(phase);
+      py += probe.ampY * Math.sin(phase + probe.phaseOffset);
     }
     return { x: px, y: py };
   },
@@ -882,11 +607,13 @@ const PerturbEngine = {
 
 
 // ─────────────────────────────────────────────
-// 4. TARGET PATH
+// 3. TARGET PATH
 // AGENT COOKIE CRUMB: Smooth Lissajous figure.
-// The slow, predictable path lets us isolate
-// the human's response to perturbations from
-// their baseline tracking behavior.
+// Now uses server-provided path parameters
+// (freqX, freqY, phase, padding) from the
+// challenge object. The slow, predictable path
+// lets us isolate the human's response to
+// perturbations from their baseline tracking.
 // ─────────────────────────────────────────────
 const TargetPath = {
   cx: 0, cy: 0, ax: 0, ay: 0,
@@ -894,23 +621,27 @@ const TargetPath = {
   init(canvasW, canvasH) {
     this.cx = canvasW / 2;
     this.cy = canvasH / 2;
-    this.ax = canvasW * Config.pathPadding;
-    this.ay = canvasH * Config.pathPadding;
+    const padding = Config.challenge ? Config.challenge.path.padding : 0.30;
+    this.ax = canvasW * padding;
+    this.ay = canvasH * padding;
   },
 
-  /** Get smooth (unperturbed) target position at time t (ms from tracking start) */
   getSmooth(t) {
+    const c = Config.challenge;
+    const freqX = c ? c.path.freqX : 0.15;
+    const freqY = c ? c.path.freqY : 0.10;
+    const phase = c ? c.path.phase : Math.PI / 4;
     const s = t / 1000;
     return {
-      x: this.cx + this.ax * Math.sin(2 * Math.PI * Config.pathFreqX * s + Config.pathPhase),
-      y: this.cy + this.ay * Math.sin(2 * Math.PI * Config.pathFreqY * s),
+      x: this.cx + this.ax * Math.sin(2 * Math.PI * freqX * s + phase),
+      y: this.cy + this.ay * Math.sin(2 * Math.PI * freqY * s),
     };
   },
 };
 
 
 // ─────────────────────────────────────────────
-// 5. DATA STORE
+// 4. DATA STORE
 // ─────────────────────────────────────────────
 const DataStore = {
   // Phase 1: Free movement
@@ -952,12 +683,17 @@ const DataStore = {
 
 
 // ─────────────────────────────────────────────
-// 6. COLLECTOR
+// 5. COLLECTOR
 // AGENT COOKIE CRUMB: Captures pointer events
 // at maximum resolution using getCoalescedEvents
 // and pointerrawupdate where available. Higher
-// sample rates → better tremor detection and
+// sample rates -> better tremor detection and
 // transfer function estimation.
+// Coordinates are stored in CSS pixels (not
+// device pixels). The server expects canvas
+// dimensions in CSS pixels and cursor data in
+// matching coordinates. DPR scaling is handled
+// by canvas ctx.scale() only.
 // ─────────────────────────────────────────────
 const Collector = {
   _canvas: null,
@@ -1066,8 +802,11 @@ const Collector = {
   _record(e) {
     const t = performance.now();
     const rect = this._canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) * (this._canvas.width / rect.width);
-    const y = (e.clientY - rect.top) * (this._canvas.height / rect.height);
+    // AGENT COOKIE CRUMB: Store in CSS pixel coordinates (not device pixels).
+    // The server expects canvas dimensions in CSS pixels and cursor data in
+    // matching coordinates. DPR scaling is handled by canvas ctx.scale() only.
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
     if (this._phase === 'free') {
       DataStore.freeMove.push({ t, x, y });
@@ -1089,909 +828,7 @@ const Collector = {
 
 
 // ─────────────────────────────────────────────
-// 7. ANALYZER
-// AGENT COOKIE CRUMB: The 8 analysis pipelines.
-// Each exploits a different physical property
-// of the human neuromechanical system that AI
-// agents fundamentally cannot reproduce.
-// ─────────────────────────────────────────────
-const Analyzer = {
-
-  results: {},
-
-  run() {
-    // Estimate sample rate from tracking data
-    if (DataStore.tracking.length > 10) {
-      const dts = [];
-      for (let i = 1; i < Math.min(DataStore.tracking.length, 500); i++) {
-        dts.push(DataStore.tracking[i].t - DataStore.tracking[i - 1].t);
-      }
-      const avgDt = dts.reduce((a, b) => a + b, 0) / dts.length;
-      DataStore.sampleRate = avgDt > 0 ? 1000 / avgDt : 60;
-    } else {
-      DataStore.sampleRate = 60;
-    }
-
-    this.results = {};
-    this.results.transferFn = this._analyzeTransferFunction();
-    this.results.tremor = this._analyzeTremor();
-    this.results.accelTremor = this._analyzeAccelTremor();
-    this.results.oneOverF = this._analyze1fNoise();
-    this.results.signalDepNoise = this._analyzeSignalDepNoise();
-    this.results.crossAxis = this._analyzeCrossAxis();
-    this.results.pulseResponse = this._analyzePulseResponses();
-    this.results.cogInterference = this._analyzeCogInterference();
-    this.results.minJerk = this._analyzeMinJerk();
-    this.results.sampleRate = DataStore.sampleRate;
-    this.results.sampleCount = DataStore.tracking.length;
-    this.results.inputMethod = DataStore.inputMethod;
-
-    return this.results;
-  },
-
-  /**
-   * ANALYSIS 1: Transfer Function
-   * Inject multi-sine perturbation → measure response at each probe frequency
-   * Human: gain rolls off above ~3-4Hz, phase increases with frequency
-   * Bot: gain ≈ 1 everywhere OR wrong rolloff pattern
-   */
-  _analyzeTransferFunction() {
-    const data = DataStore.tracking;
-    if (data.length < 64) return { valid: false };
-
-    const rate = DataStore.sampleRate;
-    const resampled = this._resampleTracking(rate);
-    if (!resampled || resampled.length < 64) return { valid: false };
-
-    const pertX = resampled.map(d => d.pertX);
-    const responseX = resampled.map(d => d.x - d.targetX + d.pertX);
-    // Response to perturbation = cursor - (target_smooth), which includes pert response
-    // Actually: cursor tracks (smooth + pert), so cursor - smooth ≈ human's response to pert + error
-    const cursorMinusSmooth = resampled.map(d => d.x - (d.targetX - d.pertX));
-
-    const tf = MathEngine.transferFunction(pertX, cursorMinusSmooth, rate);
-
-    // Extract gain and phase at probe frequencies
-    const probeResults = [];
-    for (const freq of Config.probeFreqs) {
-      // Find nearest frequency bin
-      const binIdx = Math.round(freq * tf.freqs.length * 2 / rate);
-      if (binIdx >= 0 && binIdx < tf.magnitude.length) {
-        probeResults.push({
-          freq,
-          gain: tf.magnitude[binIdx],
-          phase: tf.phase[binIdx],
-          coherence: tf.coherence[binIdx],
-        });
-      }
-    }
-
-    // Check for human-like rolloff: gain should generally decrease with frequency
-    let rolloffScore = 0;
-    for (let i = 1; i < probeResults.length; i++) {
-      if (probeResults[i].gain < probeResults[i - 1].gain) rolloffScore++;
-    }
-    const hasRolloff = rolloffScore >= 2; // at least 2 out of 4 transitions decrease
-
-    // AGENT COOKIE CRUMB: Phase delay estimation via time-delay at coherent frequencies.
-    //
-    // Previous approach (phase-frequency correlation) failed because:
-    // - At high probe frequencies (4-7Hz), humans can't track the perturbation
-    // - Coherence drops to near zero → phase estimate is pure noise
-    // - Noisy high-freq phases dominate the correlation, masking real delay
-    //
-    // New approach: Estimate time delay only from probes with meaningful coherence.
-    // delay_i = -phase_i / (2π * freq_i)  →  average weighted by coherence.
-    // Human delay should be 80-400ms. Bots are either ~0ms (instant) or
-    // show inconsistent/nonsensical delays across frequencies.
-    const delays = [];
-    const coherentProbes = [];
-    let totalCoherence = 0;
-    let weightedDelay = 0;
-
-    for (const pr of probeResults) {
-      if (pr.coherence > 0.15) {
-        // Estimate delay from phase: delay = -phase / (2π * freq)
-        // Phase is in [-π, π]; negative phase = lagging = positive delay
-        const delay = -pr.phase / (2 * Math.PI * pr.freq) * 1000; // ms
-        // Sanity: delay should be -200ms to +600ms (allow some prediction)
-        if (delay > -200 && delay < 600) {
-          delays.push(delay);
-          coherentProbes.push(pr);
-          weightedDelay += delay * pr.coherence;
-          totalCoherence += pr.coherence;
-        }
-      }
-    }
-
-    const meanDelay = totalCoherence > 0 ? weightedDelay / totalCoherence : null;
-    // Human plausible delay: 80-400ms. Near-zero or very negative = bot-like.
-    const hasPhaseDelay = meanDelay !== null && meanDelay > 50;
-    const delayPlausible = meanDelay !== null && meanDelay > 30 && meanDelay < 500;
-
-    return {
-      valid: true,
-      probeResults,
-      hasRolloff,
-      hasPhaseDelay,
-      meanDelay,
-      delayPlausible,
-      coherentProbeCount: coherentProbes.length,
-      fullTF: tf,
-    };
-  },
-
-  /**
-   * ANALYSIS 2: Physiological Tremor Detection
-   * Look for 8-12Hz power in cursor velocity residuals
-   * Human: measurable peak in tremor band
-   * Bot: no tremor, or artificial tremor at wrong frequency/amplitude
-   */
-  _analyzeTremor() {
-    const data = DataStore.tracking;
-    if (data.length < 64) return { valid: false };
-
-    const rate = DataStore.sampleRate;
-    if (rate < 20) return { valid: false, reason: 'Sample rate too low for tremor detection' };
-
-    // Compute cursor velocity
-    const resampled = this._resampleTracking(Math.min(rate, 120));
-    if (!resampled || resampled.length < 64) return { valid: false };
-
-    const velX = MathEngine.velocity(
-      resampled.map(d => d.x),
-      resampled.map(d => d.t)
-    );
-    const velY = MathEngine.velocity(
-      resampled.map(d => d.y),
-      resampled.map(d => d.t)
-    );
-    // Combine into speed
-    const speed = velX.map((vx, i) => Math.sqrt(vx ** 2 + (velY[i] || 0) ** 2));
-
-    // Remove slow trends (high-pass at 3Hz) by subtracting smoothed version
-    const smoothed = this._movingAvg(speed, Math.round(Math.min(rate, 120) / 3));
-    const residual = speed.map((s, i) => s - (smoothed[i] || 0));
-
-    // PSD of residual
-    const psdResult = MathEngine.psd(residual, Math.min(rate, 120));
-
-    // Tremor band power
-    let tremorPower = 0, totalPower = 0, peakFreq = 0, peakPow = 0;
-    for (let i = 0; i < psdResult.freqs.length; i++) {
-      const f = psdResult.freqs[i];
-      const p = psdResult.power[i];
-      if (f > 1) totalPower += p; // exclude DC and very low freq
-      if (f >= Config.tremorBandLow && f <= Config.tremorBandHigh) {
-        tremorPower += p;
-        if (p > peakPow) { peakPow = p; peakFreq = f; }
-      }
-    }
-
-    const tremorRatio = totalPower > 0 ? tremorPower / totalPower : 0;
-
-    return {
-      valid: true,
-      tremorRatio,
-      peakFrequency: peakFreq,
-      tremorPower,
-      totalPower,
-      psd: psdResult,
-    };
-  },
-
-  /**
-   * ANALYSIS 2b: Accelerometer-Based Tremor Detection (Mobile)
-   *
-   * AGENT COOKIE CRUMB: On mobile devices, cursor position tremor is unreliable
-   * because the capacitive touch digitizer spatially low-passes the tiny 8-12Hz
-   * displacements (finger contact area ~10mm vs tremor amplitude ~0.1mm).
-   *
-   * The device accelerometer bypasses this entirely — it measures inertial
-   * forces on the device body caused by hand tremor. When a user holds the
-   * phone and touches the screen, their physiological tremor vibrates the
-   * entire device at 8-12Hz. The accelerometer captures this at 60-100Hz
-   * with sub-mG resolution, far exceeding what touch position can resolve.
-   *
-   * We compute the PSD of high-pass-filtered accel magnitude and look for
-   * the same 8-12Hz tremor band power ratio used in cursor-based detection.
-   */
-  _analyzeAccelTremor() {
-    const samples = DataStore.accelSamples;
-    if (samples.length < 64) return { valid: false, reason: 'Insufficient accelerometer data' };
-
-    // Estimate accelerometer sample rate
-    const dts = [];
-    for (let i = 1; i < Math.min(samples.length, 500); i++) {
-      dts.push(samples[i].t - samples[i - 1].t);
-    }
-    const avgDt = dts.reduce((a, b) => a + b, 0) / dts.length;
-    const rate = avgDt > 0 ? 1000 / avgDt : 60;
-
-    if (rate < 20) return { valid: false, reason: 'Accel sample rate too low for tremor' };
-
-    // Compute acceleration magnitude (captures tremor in all axes)
-    const magnitudes = samples.map(s => Math.sqrt(s.ax ** 2 + s.ay ** 2 + s.az ** 2));
-    const timestamps = samples.map(s => s.t);
-
-    // Resample to uniform rate for FFT
-    const targetRate = Math.min(rate, 100);
-    const resampled = MathEngine.resample(magnitudes, timestamps, targetRate);
-    if (resampled.values.length < 64) return { valid: false, reason: 'Too few resampled accel points' };
-
-    // High-pass filter: remove gravity and slow drift via moving average subtraction
-    const smoothed = this._movingAvg(resampled.values, Math.round(targetRate / 3));
-    const residual = resampled.values.map((v, i) => v - (smoothed[i] || 0));
-
-    // PSD of high-passed accel magnitude
-    const psdResult = MathEngine.psd(residual, targetRate);
-
-    // Tremor band power
-    let tremorPower = 0, totalPower = 0, peakFreq = 0, peakPow = 0;
-    for (let i = 0; i < psdResult.freqs.length; i++) {
-      const f = psdResult.freqs[i];
-      const p = psdResult.power[i];
-      if (f > 1) totalPower += p;
-      if (f >= Config.tremorBandLow && f <= Config.tremorBandHigh) {
-        tremorPower += p;
-        if (p > peakPow) { peakPow = p; peakFreq = f; }
-      }
-    }
-
-    const tremorRatio = totalPower > 0 ? tremorPower / totalPower : 0;
-
-    return {
-      valid: true,
-      tremorRatio,
-      peakFrequency: peakFreq,
-      tremorPower,
-      totalPower,
-      sampleRate: rate,
-      sampleCount: samples.length,
-      psd: psdResult,
-    };
-  },
-
-  /**
-   * ANALYSIS 3: 1/f Noise Structure
-   * Biological control systems produce pink noise (PSD ∝ 1/f^α, α ≈ 1)
-   * Bot: white noise (α ≈ 0) or brown noise (α ≈ 2) or no noise
-   *
-   * AGENT COOKIE CRUMB: We analyze VELOCITY of tracking error, not position.
-   * Position error is dominated by slow tracking dynamics (produces steep
-   * slopes ~-3 to -4). Differentiating to velocity removes one order of
-   * integration, bringing the slope into the expected [-2, -0.3] range
-   * where pink noise (α ≈ -1) lives.
-   */
-  _analyze1fNoise() {
-    const data = DataStore.tracking;
-    if (data.length < 128) return { valid: false };
-
-    const rate = DataStore.sampleRate;
-    const resampled = this._resampleTracking(rate);
-    if (!resampled || resampled.length < 128) return { valid: false };
-
-    // Compute velocity of tracking error (differentiate position error)
-    // This removes the slow tracking drift that dominates position PSD
-    const errorX = resampled.map(d => d.x - d.targetX);
-    const errorVelX = MathEngine.velocity(errorX, resampled.map(d => d.t));
-
-    if (errorVelX.length < 64) return { valid: false };
-
-    const psdResult = MathEngine.psd(errorVelX, rate);
-
-    // Fit log-log slope excluding DC, very low freqs, and above Nyquist/2
-    const logF = [], logP = [];
-    for (let i = 0; i < psdResult.freqs.length; i++) {
-      const f = psdResult.freqs[i];
-      const p = psdResult.power[i];
-      if (f >= 0.3 && f <= rate / 4 && p > 0) {
-        logF.push(Math.log10(f));
-        logP.push(Math.log10(p));
-      }
-    }
-
-    const reg = MathEngine.linReg(logF, logP);
-
-    return {
-      valid: true,
-      slope: reg.slope,       // Should be ~ -1 for pink noise in velocity domain
-      r2: reg.r2,
-      psd: psdResult,
-    };
-  },
-
-  /**
-   * ANALYSIS 4: Signal-Dependent Noise
-   * Harris & Wolpert (1998): motor noise variance ∝ signal magnitude
-   * Human: positive correlation between speed and variability
-   * Bot: uniform noise regardless of speed, or no noise
-   */
-  _analyzeSignalDepNoise() {
-    const data = DataStore.tracking;
-    if (data.length < 100) return { valid: false };
-
-    // Compute speed and local variability in overlapping windows
-    const windowSize = 15;
-    const speeds = [];
-    const variabilities = [];
-
-    for (let i = windowSize; i < data.length - windowSize; i += Math.max(1, Math.floor(windowSize / 2))) {
-      const window = data.slice(i - windowSize, i + windowSize);
-      // Speed: average velocity magnitude in window
-      let totalSpeed = 0;
-      const errors = [];
-      for (let j = 1; j < window.length; j++) {
-        const dt = (window[j].t - window[j - 1].t) / 1000;
-        if (dt > 0) {
-          const vx = (window[j].x - window[j - 1].x) / dt;
-          const vy = (window[j].y - window[j - 1].y) / dt;
-          totalSpeed += Math.sqrt(vx ** 2 + vy ** 2);
-        }
-        // Tracking error
-        errors.push(Math.sqrt((window[j].x - window[j].targetX) ** 2 + (window[j].y - window[j].targetY) ** 2));
-      }
-      const avgSpeed = totalSpeed / (window.length - 1);
-      const errStats = MathEngine.stats(errors);
-
-      if (avgSpeed > 10) { // ignore stationary periods
-        speeds.push(avgSpeed);
-        variabilities.push(errStats.std);
-      }
-    }
-
-    if (speeds.length < 10) return { valid: false };
-
-    const reg = MathEngine.linReg(speeds, variabilities);
-    const corr = MathEngine.correlation(speeds, variabilities);
-
-    return {
-      valid: true,
-      slope: reg.slope,
-      correlation: corr,
-      r2: reg.r2,
-      dataPoints: speeds.length,
-      speeds,
-      variabilities,
-    };
-  },
-
-  /**
-   * ANALYSIS 5: Cross-Axis Coupling
-   * Human: X perturbation causes Y response (forearm biomechanics)
-   * Bot: X and Y independently controlled → no coupling
-   */
-  _analyzeCrossAxis() {
-    const pulses = PerturbEngine.pulseSchedule.filter(p => p.triggered);
-    if (pulses.length < 3) return { valid: false };
-
-    const data = DataStore.tracking;
-    const couplingValues = [];
-
-    for (const pulse of pulses) {
-      // Extract 400ms window after pulse
-      const window = data.filter(d => d.t >= pulse.time && d.t < pulse.time + 400);
-      if (window.length < 5) continue;
-
-      // X displacement (should be large, in direction of pulse)
-      const dx = window[window.length - 1].x - window[0].x;
-      // Y displacement (should be non-zero for humans due to coupling)
-      const dy = window[window.length - 1].y - window[0].y;
-
-      // Coupling ratio: |dy/dx|
-      if (Math.abs(dx) > 2) {
-        couplingValues.push(Math.abs(dy / dx));
-      }
-    }
-
-    if (couplingValues.length < 2) return { valid: false };
-
-    const stats = MathEngine.stats(couplingValues);
-    return {
-      valid: true,
-      meanCoupling: stats.mean,
-      stdCoupling: stats.std,
-      values: couplingValues,
-    };
-  },
-
-  /**
-   * ANALYSIS 6: Pulse Response Transients
-   * Measure latency, rise time, overshoot, settling after each pulse
-   * Human: 150-300ms latency, smooth correction, possible overshoot
-   * Bot: either too fast, too precise, or wrong dynamics
-   */
-  _analyzePulseResponses() {
-    const pulses = PerturbEngine.pulseSchedule.filter(p => p.triggered);
-    if (pulses.length < 3) return { valid: false };
-
-    const data = DataStore.tracking;
-    const responses = [];
-
-    for (const pulse of pulses) {
-      // Get baseline window (200ms before pulse) to estimate pre-pulse velocity
-      const baseline = data.filter(d => d.t >= pulse.time - 200 && d.t < pulse.time);
-      const window = data.filter(d => d.t >= pulse.time && d.t < pulse.time + 600);
-
-      if (baseline.length < 3 || window.length < 5) continue;
-
-      const baseX = baseline[baseline.length - 1].x;
-      const pertDir = Math.sign(pulse.ampX);
-
-      // AGENT COOKIE CRUMB: Detrend by subtracting pre-pulse velocity.
-      // Without detrending, a user already moving at 500px/s when a 22px
-      // pulse fires would show 500px/s * 0.6s / 22px ≈ 13.6x "correction",
-      // i.e. ~1260% overshoot — obviously wrong. By subtracting the linear
-      // trend from pre-pulse velocity, we isolate the actual corrective response.
-      const prePulseVelX = baseline.length >= 3
-        ? (baseline[baseline.length - 1].x - baseline[0].x) /
-          ((baseline[baseline.length - 1].t - baseline[0].t) / 1000 + 0.001)
-        : 0;
-
-      const normalized = window.map(d => {
-        const dt = (d.t - pulse.time) / 1000; // seconds
-        const detrended = (d.x - baseX) - prePulseVelX * dt;
-        return {
-          t: d.t - pulse.time,
-          correction: detrended * pertDir / Math.abs(pulse.ampX),
-        };
-      });
-
-      // AGENT COOKIE CRUMB: Robust onset detection. After detrending, the
-      // signal hovers near zero with cursor noise (~2-5px). A naive threshold
-      // of 10% (2.2px) triggers on noise instantly (13ms latency — impossible).
-      //
-      // Fix: Two-stage detection:
-      // 1. Minimum latency floor of 80ms (no human can visually react faster)
-      // 2. Require correction to exceed 20% AND remain above 15% for ≥40ms
-      //    (sustained movement, not a noise spike)
-      const ONSET_THRESHOLD = 0.20;
-      const SUSTAIN_THRESHOLD = 0.15;
-      const SUSTAIN_DURATION = 40; // ms
-      const MIN_LATENCY = 80;     // ms — human physiological minimum
-
-      let latency = null;
-      for (let i = 0; i < normalized.length; i++) {
-        const pt = normalized[i];
-        if (pt.t < MIN_LATENCY) continue;
-        if (pt.correction > ONSET_THRESHOLD) {
-          // Verify sustained: check that correction stays above sustain threshold
-          let sustained = true;
-          for (let j = i + 1; j < normalized.length; j++) {
-            if (normalized[j].t - pt.t > SUSTAIN_DURATION) break;
-            if (normalized[j].correction < SUSTAIN_THRESHOLD) {
-              sustained = false;
-              break;
-            }
-          }
-          if (sustained) {
-            latency = pt.t;
-            break;
-          }
-        }
-      }
-
-      // Find peak correction (only after onset, or after MIN_LATENCY if no onset)
-      const searchStart = latency || MIN_LATENCY;
-      let peakCorr = 0, peakTime = 0;
-      for (const pt of normalized) {
-        if (pt.t >= searchStart && pt.correction > peakCorr) {
-          peakCorr = pt.correction;
-          peakTime = pt.t;
-        }
-      }
-
-      // Overshoot: peak > 1.0 means overcorrection
-      const overshoot = Math.max(0, peakCorr - 1.0);
-
-      responses.push({ latency, peakCorr, peakTime, overshoot, normalized });
-    }
-
-    if (responses.length < 2) return { valid: false };
-
-    const latencies = responses.filter(r => r.latency !== null).map(r => r.latency);
-    const latencyStats = MathEngine.stats(latencies);
-    const overshoots = responses.map(r => r.overshoot);
-
-    return {
-      valid: true,
-      responses,
-      latencyMean: latencyStats.mean,
-      latencyStd: latencyStats.std,
-      latencyMin: latencyStats.min,
-      latencyMax: latencyStats.max,
-      meanOvershoot: MathEngine.stats(overshoots).mean,
-    };
-  },
-
-  /**
-   * ANALYSIS 7: Cognitive-Motor Interference
-   * During dual-task phase, tracking error should increase when cognitive
-   * flashes appear (especially target-color flashes).
-   * Human: measurable degradation (~5-15% increase in error)
-   * Bot: no degradation (no cognitive system to interfere)
-   */
-  _analyzeCogInterference() {
-    const flashes = DataStore.cogFlashes;
-    if (flashes.length < 3) return { valid: false };
-
-    const data = DataStore.tracking;
-    if (data.length < 50) return { valid: false };
-
-    // Compute tracking error around each flash
-    const flashEffects = [];
-    for (const flash of flashes) {
-      // 500ms before flash
-      const before = data.filter(d => d.t >= flash.t - 500 && d.t < flash.t);
-      // 200-700ms after flash (allowing for visual processing delay)
-      const after = data.filter(d => d.t >= flash.t + 200 && d.t < flash.t + 700);
-
-      if (before.length < 3 || after.length < 3) continue;
-
-      const errBefore = MathEngine.stats(before.map(d =>
-        Math.sqrt((d.x - d.targetX) ** 2 + (d.y - d.targetY) ** 2)
-      )).mean;
-
-      const errAfter = MathEngine.stats(after.map(d =>
-        Math.sqrt((d.x - d.targetX) ** 2 + (d.y - d.targetY) ** 2)
-      )).mean;
-
-      const increase = errBefore > 0 ? (errAfter - errBefore) / errBefore : 0;
-      flashEffects.push({ isTarget: flash.isTarget, increase, errBefore, errAfter });
-    }
-
-    if (flashEffects.length < 2) return { valid: false };
-
-    const targetEffects = flashEffects.filter(f => f.isTarget);
-    const nonTargetEffects = flashEffects.filter(f => !f.isTarget);
-
-    const targetInterference = targetEffects.length > 0
-      ? MathEngine.stats(targetEffects.map(f => f.increase)).mean : 0;
-    const nonTargetInterference = nonTargetEffects.length > 0
-      ? MathEngine.stats(nonTargetEffects.map(f => f.increase)).mean : 0;
-
-    // Humans show MORE interference for attended (target) flashes
-    const attentionEffect = targetInterference - nonTargetInterference;
-
-    // Check cognitive answer accuracy
-    const correctAnswer = flashes.filter(f => f.isTarget).length;
-    const userAnswer = DataStore.cogAnswer;
-    const answerAccuracy = userAnswer !== null ? (userAnswer === correctAnswer ? 1 : 0) : null;
-
-    return {
-      valid: true,
-      targetInterference,
-      nonTargetInterference,
-      attentionEffect,
-      answerAccuracy,
-      correctAnswer,
-      userAnswer,
-      flashEffects,
-    };
-  },
-
-  /**
-   * ANALYSIS 8: Minimum Jerk Fit
-   * Human corrections follow minimum-jerk trajectory (Flash & Hogan, 1985)
-   * producing bell-shaped velocity profiles.
-   * Bot: linear velocity, or wrong profile shape
-   */
-  _analyzeMinJerk() {
-    // Use pulse responses for this analysis
-    const pulseResult = this.results.pulseResponse;
-    if (!pulseResult || !pulseResult.valid || pulseResult.responses.length < 2) {
-      return { valid: false };
-    }
-
-    // AGENT COOKIE CRUMB: Minimum jerk model assumes smooth point-to-point
-    // movement. We fit it to the RISING phase of the correction (onset → peak).
-    // Requires valid onset detection (latency ≥ 80ms) to avoid fitting noise.
-    const r2Values = [];
-    for (const resp of pulseResult.responses) {
-      // Require valid latency (≥80ms) — if onset detection failed, skip
-      if (!resp.latency || resp.latency < 80) continue;
-      if (resp.normalized.length < 8) continue;
-
-      // Extract the correction movement: onset → peak
-      const moveStart = resp.latency;
-      const moveEnd = resp.peakTime || resp.latency + 300;
-      const movePts = resp.normalized.filter(p => p.t >= moveStart && p.t <= moveEnd);
-
-      if (movePts.length < 4) continue;
-
-      // Minimum jerk trajectory: x(τ) = x0 + (xf-x0)(10τ³ - 15τ⁴ + 6τ⁵)
-      const t0 = movePts[0].t;
-      const tf = movePts[movePts.length - 1].t;
-      const x0 = movePts[0].correction;
-      const xf = movePts[movePts.length - 1].correction;
-      const dur = tf - t0;
-
-      if (dur < 30) continue; // need at least 30ms of movement
-
-      let ssRes = 0, ssTot = 0;
-      const meanCorr = movePts.reduce((a, p) => a + p.correction, 0) / movePts.length;
-
-      for (const pt of movePts) {
-        const tau = Math.max(0, Math.min(1, (pt.t - t0) / dur));
-        const predicted = x0 + (xf - x0) * (10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5);
-        ssRes += (pt.correction - predicted) ** 2;
-        ssTot += (pt.correction - meanCorr) ** 2;
-      }
-
-      const r2 = ssTot > 1e-10 ? Math.max(0, 1 - ssRes / ssTot) : 0;
-      r2Values.push(r2);
-    }
-
-    if (r2Values.length < 1) return { valid: false };
-
-    return {
-      valid: true,
-      meanR2: MathEngine.stats(r2Values).mean,
-      r2Values,
-    };
-  },
-
-  /** Helper: resample tracking data to uniform rate */
-  _resampleTracking(targetRate) {
-    const data = DataStore.tracking;
-    if (data.length < 4) return null;
-
-    const resX = MathEngine.resample(data.map(d => d.x), data.map(d => d.t), targetRate);
-    const resY = MathEngine.resample(data.map(d => d.y), data.map(d => d.t), targetRate);
-    const resTX = MathEngine.resample(data.map(d => d.targetX), data.map(d => d.t), targetRate);
-    const resTY = MathEngine.resample(data.map(d => d.targetY), data.map(d => d.t), targetRate);
-    const resPX = MathEngine.resample(data.map(d => d.pertX), data.map(d => d.t), targetRate);
-    const resPY = MathEngine.resample(data.map(d => d.pertY), data.map(d => d.t), targetRate);
-
-    return resX.values.map((_, i) => ({
-      t: resX.timestamps[i],
-      x: resX.values[i],
-      y: resY.values[i],
-      targetX: resTX.values[i],
-      targetY: resTY.values[i],
-      pertX: resPX.values[i],
-      pertY: resPY.values[i],
-    }));
-  },
-
-  /** Simple moving average */
-  _movingAvg(arr, windowSize) {
-    const result = [];
-    for (let i = 0; i < arr.length; i++) {
-      const start = Math.max(0, i - Math.floor(windowSize / 2));
-      const end = Math.min(arr.length, i + Math.floor(windowSize / 2) + 1);
-      let sum = 0;
-      for (let j = start; j < end; j++) sum += arr[j];
-      result.push(sum / (end - start));
-    }
-    return result;
-  },
-};
-
-
-// ─────────────────────────────────────────────
-// 8. SCORER
-// AGENT COOKIE CRUMB: MODEL-BASED scoring.
-// Each metric is scored against known human
-// biomechanical ranges — NOT against learned
-// distributions. This is why we don't need a
-// data flywheel.
-// ─────────────────────────────────────────────
-const Scorer = {
-
-  /**
-   * Sigmoid scoring function
-   * Returns value in [0, 1] representing human plausibility
-   */
-  _sigmoid(x, center, steepness) {
-    return 1 / (1 + Math.exp(-steepness * (x - center)));
-  },
-
-  /** Score within a range (1.0 inside range, drops off outside) */
-  _rangeScore(value, low, high, steepness = 5) {
-    const midLow = this._sigmoid(value, low, steepness);
-    const midHigh = this._sigmoid(value, high, -steepness);
-    return Math.min(1, midLow * midHigh * 4); // clamp to [0,1]
-  },
-
-  score(results) {
-    const scores = {};
-    let validCount = 0;
-    let weightedSum = 0;
-    let totalWeight = 0;
-
-    // 1. Transfer Function (weight: 3)
-    // AGENT COOKIE CRUMB: Gain rolloff is the primary discriminator (bots have
-    // flat gain). Phase delay is secondary — harder to estimate because coherence
-    // drops at high frequencies where humans can't track. Weight: 70/30.
-    if (results.transferFn && results.transferFn.valid) {
-      const tf = results.transferFn;
-      let s = 0;
-      if (tf.hasRolloff) s += 0.7;       // Primary: frequency-dependent gain
-      if (tf.hasPhaseDelay) s += 0.15;    // Secondary: neural conduction delay
-      if (tf.delayPlausible) s += 0.15;   // Tertiary: delay magnitude in human range
-      s = Math.min(1, s);
-      const delayStr = tf.meanDelay !== null ? `${tf.meanDelay.toFixed(0)}ms` : 'N/A';
-      const cohStr = tf.coherentProbeCount || 0;
-      scores.transferFn = { score: s, weight: 3, label: 'Transfer Function',
-        detail: `Gain rolloff: ${tf.hasRolloff ? 'YES' : 'NO'}, Est. delay: ${delayStr} (${cohStr} coherent probes)` };
-      weightedSum += s * 3; totalWeight += 3; validCount++;
-    }
-
-    // 2. Physiological Tremor (weight: 2.5)
-    // AGENT COOKIE CRUMB: On mobile (touch input), cursor-based tremor detection
-    // is unreliable because the touch digitizer spatially low-passes tremor.
-    // The device accelerometer captures hand tremor at 8-12Hz via inertial
-    // measurement. We compute scores from BOTH sources and use the stronger
-    // signal, giving mobile devices a fair chance at tremor detection.
-    {
-      const hasCursor = results.tremor && results.tremor.valid;
-      const hasAccel = results.accelTremor && results.accelTremor.valid;
-
-      if (hasCursor || hasAccel) {
-        // Cursor-based tremor score
-        let cursorScore = 0;
-        let cursorDetail = '';
-        if (hasCursor) {
-          const tr = results.tremor;
-          cursorScore = Math.min(1, tr.tremorRatio / (Config.humanTremorRatioMin * 3));
-          if (tr.peakFrequency >= 7 && tr.peakFrequency <= 13) cursorScore = Math.min(1, cursorScore + 0.2);
-          cursorDetail = `Cursor: ${(tr.tremorRatio * 100).toFixed(2)}%@${tr.peakFrequency.toFixed(1)}Hz`;
-        }
-
-        // Accelerometer-based tremor score
-        let accelScore = 0;
-        let accelDetail = '';
-        if (hasAccel) {
-          const at = results.accelTremor;
-          accelScore = Math.min(1, at.tremorRatio / (Config.humanTremorRatioMin * 3));
-          if (at.peakFrequency >= 7 && at.peakFrequency <= 13) accelScore = Math.min(1, accelScore + 0.2);
-          accelDetail = `Accel: ${(at.tremorRatio * 100).toFixed(2)}%@${at.peakFrequency.toFixed(1)}Hz (${at.sampleCount} samples, ${Math.round(at.sampleRate)}Hz)`;
-        }
-
-        // Use whichever source has the stronger tremor signal
-        const s = Math.max(cursorScore, accelScore);
-        const source = accelScore > cursorScore ? 'accelerometer' : 'cursor';
-        const detail = [cursorDetail, accelDetail].filter(Boolean).join(' | ') + ` [best: ${source}]`;
-
-        scores.tremor = { score: s, weight: 2.5, label: 'Physiological Tremor', detail };
-        weightedSum += s * 2.5; totalWeight += 2.5; validCount++;
-      }
-    }
-
-    // 3. 1/f Noise (weight: 2)
-    if (results.oneOverF && results.oneOverF.valid) {
-      const of = results.oneOverF;
-      const s = this._rangeScore(of.slope, Config.human1fSlopeRange[0], Config.human1fSlopeRange[1], 3);
-      scores.oneOverF = { score: s, weight: 2, label: '1/f Noise Structure',
-        detail: `Velocity-domain slope: ${of.slope.toFixed(2)} (human range: ${Config.human1fSlopeRange[0]} to ${Config.human1fSlopeRange[1]}), R²: ${of.r2.toFixed(2)}` };
-      weightedSum += s * 2; totalWeight += 2; validCount++;
-    }
-
-    // 4. Signal-Dependent Noise (weight: 2.5)
-    if (results.signalDepNoise && results.signalDepNoise.valid) {
-      const sdn = results.signalDepNoise;
-      // Positive correlation between speed and variability
-      const s = Math.max(0, Math.min(1, sdn.correlation / 0.4));
-      scores.signalDepNoise = { score: s, weight: 2.5, label: 'Signal-Dependent Noise',
-        detail: `Correlation: ${sdn.correlation.toFixed(3)}, Slope: ${sdn.slope.toFixed(4)}` };
-      weightedSum += s * 2.5; totalWeight += 2.5; validCount++;
-    }
-
-    // 5. Cross-Axis Coupling (weight: 2)
-    // AGENT COOKIE CRUMB: On touch input, cross-axis coupling is naturally much
-    // higher than mouse/trackpad because: (1) finger-on-glass has lateral slippage
-    // during corrective movements, (2) holding a phone engages different wrist
-    // mechanics than a mouse on a desk, (3) the large touch contact area causes
-    // small diagonal movements to register as significant Y displacement.
-    // Desktop mouse coupling is typically 0.03-2.0; touch coupling is 1.0-8.0+.
-    // We scale thresholds by input method to avoid penalizing legitimate touch users.
-    if (results.crossAxis && results.crossAxis.valid) {
-      const ca = results.crossAxis;
-      const isTouch = results.inputMethod === 'touch';
-      // Touch: higher coupling is natural; scale thresholds accordingly
-      const idealMax = isTouch ? 8 : 2;
-      const scoreDenom = isTouch ? 1.0 : 0.3;
-      const s = Math.min(1, ca.meanCoupling / scoreDenom) * (ca.meanCoupling < idealMax ? 1 : 0.5);
-      scores.crossAxis = { score: s, weight: 2, label: 'Cross-Axis Coupling',
-        detail: `Mean coupling: ${ca.meanCoupling.toFixed(3)} (Y response per unit X perturbation)${isTouch ? ' [touch-adjusted]' : ''}` };
-      weightedSum += s * 2; totalWeight += 2; validCount++;
-    }
-
-    // 6. Pulse Response Latency (weight: 3)
-    if (results.pulseResponse && results.pulseResponse.valid) {
-      const pr = results.pulseResponse;
-      // Latency should be in human range (120-380ms) with reasonable variance
-      const latScore = this._rangeScore(pr.latencyMean,
-        Config.humanLatencyRange[0], Config.humanLatencyRange[1], 0.03);
-      const varScore = this._rangeScore(pr.latencyStd,
-        Config.humanLatencySD[0], Config.humanLatencySD[1], 0.08);
-      const s = (latScore * 0.6 + varScore * 0.4);
-      const detectedPulses = pr.responses.filter(r => r.latency !== null).length;
-      scores.pulseResponse = { score: s, weight: 3, label: 'Response Latency',
-        detail: `Mean: ${pr.latencyMean.toFixed(0)}ms (σ=${pr.latencyStd.toFixed(0)}ms), ${detectedPulses}/${pr.responses.length} pulses detected` };
-      weightedSum += s * 3; totalWeight += 3; validCount++;
-    }
-
-    // 7. Cognitive-Motor Interference (weight: 2)
-    // AGENT COOKIE CRUMB: Redesigned scoring after real-world testing.
-    // Key insight: ANY flash causing tracking degradation proves biological
-    // attentional bottleneck — it doesn't have to be target-only. Also,
-    // getting the count wrong doesn't mean disengagement — it means the
-    // dual-task was hard, which is itself evidence of a biological system
-    // with limited cognitive resources.
-    if (results.cogInterference && results.cogInterference.valid) {
-      const ci = results.cogInterference;
-      const allEffects = ci.flashEffects.map(f => f.increase);
-      const meanAllInterference = MathEngine.stats(allEffects).mean;
-      const maxInterference = Math.max(...allEffects.map(f => Math.abs(f)));
-
-      // Score based on overall flash-triggered interference (any flash)
-      let s = Math.min(1, Math.max(0, meanAllInterference) / 0.12);
-
-      // Also give credit if ANY flash caused strong interference (peak sensitivity)
-      s = Math.max(s, Math.min(1, maxInterference / 0.25));
-
-      // Bonus for attention effect (target > non-target = selective attention)
-      if (ci.attentionEffect > 0.02) s = Math.min(1, s + 0.2);
-
-      // Bonus for cognitive engagement: answering at all + being close
-      if (ci.userAnswer !== null) {
-        s = Math.min(1, s + 0.1);
-        const error = Math.abs(ci.userAnswer - ci.correctAnswer);
-        if (error <= 1) s = Math.min(1, s + 0.15); // close enough
-      }
-
-      scores.cogInterference = { score: s, weight: 2, label: 'Cognitive-Motor Interference',
-        detail: `Mean interference: ${(meanAllInterference * 100).toFixed(1)}%, ` +
-                `Attention effect: ${(ci.attentionEffect * 100).toFixed(1)}%, ` +
-                `Answer: ${ci.userAnswer}/${ci.correctAnswer}` };
-      weightedSum += s * 2; totalWeight += 2; validCount++;
-    }
-
-    // 8. Minimum Jerk Fit (weight: 1.5)
-    // AGENT COOKIE CRUMB: Real biological movements are noisy and contain
-    // submovements, so perfect R²=1.0 is unrealistic. R² of 0.3-0.7 is
-    // typical for human corrective movements. Bots using linear interpolation
-    // or Bezier curves produce R² ≈ 0 against the min-jerk model.
-    if (results.minJerk && results.minJerk.valid) {
-      const mj = results.minJerk;
-      // Scale: R²≥0.2 starts scoring, R²≥0.6 is full marks
-      const s = Math.min(1, Math.max(0, mj.meanR2 / 0.6));
-      scores.minJerk = { score: s, weight: 1.5, label: 'Minimum Jerk Trajectory',
-        detail: `Mean R²: ${mj.meanR2.toFixed(3)} (≥0.6 = strong biological match, typical human: 0.3-0.7)` };
-      weightedSum += s * 1.5; totalWeight += 1.5; validCount++;
-    }
-
-    // Overall score
-    const overall = totalWeight > 0 ? weightedSum / totalWeight : 0;
-
-    // Determine verdict
-    let verdict, verdictClass;
-    if (overall >= 0.65) {
-      verdict = 'BIOLOGICAL CONTROLLER DETECTED';
-      verdictClass = 'score-human';
-    } else if (overall >= 0.35) {
-      verdict = 'UNCERTAIN — INCONCLUSIVE SIGNALS';
-      verdictClass = 'score-uncertain';
-    } else {
-      verdict = 'NON-BIOLOGICAL CONTROLLER SUSPECTED';
-      verdictClass = 'score-bot';
-    }
-
-    return {
-      overall,
-      scores,
-      validCount,
-      verdict,
-      verdictClass,
-    };
-  },
-};
-
-
-// ─────────────────────────────────────────────
-// 9. RENDERER
+// 6. RENDERER
 // ─────────────────────────────────────────────
 const Renderer = {
   canvas: null,
@@ -2084,7 +921,7 @@ const Renderer = {
       ctx.setLineDash([]);
 
       // Perturbation indicator (subtle flash when pulse fires)
-      if (Math.abs(pertX) > Config.pulseAmp * 0.5 || Math.abs(pertY) > Config.pulseAmp * 0.5) {
+      if (Math.abs(pertX) > 10 || Math.abs(pertY) > 10) {
         ctx.beginPath();
         ctx.arc(targetX, targetY, 25, 0, Math.PI * 2);
         ctx.strokeStyle = 'rgba(255, 167, 38, 0.4)';
@@ -2203,66 +1040,73 @@ const Renderer = {
 
 
 // ─────────────────────────────────────────────
-// 10. COGNITIVE TASK
+// 7. SERVER API
+// AGENT COOKIE CRUMB: Handles communication with
+// the CLNP verification server. The client sends
+// raw data; the server runs analysis with secret
+// scoring thresholds and returns a verdict.
+// ─────────────────────────────────────────────
+const ServerAPI = {
+  async fetchChallenge() {
+    const res = await fetch(Config.serverUrl + '/api/challenge', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    if (!res.ok) throw new Error(`Challenge request failed: ${res.status}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Challenge generation failed');
+    return data;
+  },
+
+  async submitVerification(payload) {
+    const res = await fetch(Config.serverUrl + '/api/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) throw new Error(`Verification failed: ${res.status}`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Verification failed');
+    return data;
+  },
+};
+
+
+// ─────────────────────────────────────────────
+// 8. COGNITIVE TASK
+// AGENT COOKIE CRUMB: Flash schedule now comes
+// from the server challenge. The server randomizes
+// target color, count, flash timing, and numbers.
+// This method converts relative offsetMs to
+// absolute timestamps.
 // ─────────────────────────────────────────────
 const CogTask = {
   _flashEl: null,
   _schedule: [],
   _flashIdx: 0,
   _active: false,
-  targetColor: '#ff4444',    // randomized each run
-  targetColorName: 'RED',    // display name for UI
+  targetColor: '#ff4444',
+  targetColorName: 'RED',
 
   init(el) {
     this._flashEl = el;
   },
 
-  /**
-   * Generate flash schedule for dual-task phase
-   * AGENT COOKIE CRUMB: Both target COLOR and COUNT are randomized each run.
-   * Prevents bots from hardcoding the answer. Count ranges from 2-5.
-   * Color is picked from 3 options (red/blue/green).
-   */
-  generateSchedule(startTime, duration) {
-    this._schedule = [];
+  // AGENT COOKIE CRUMB: Flash schedule now comes from the server challenge.
+  // The server randomizes target color, count, flash timing, and numbers.
+  // This method converts relative offsetMs to absolute timestamps.
+  loadSchedule(startTime) {
+    const cog = Config.challenge.cogTask;
+    this.targetColor = cog.targetColor;
+    this.targetColorName = cog.targetColorName;
+    this._schedule = cog.flashes.map(f => ({
+      t: startTime + f.offsetMs,
+      number: f.number,
+      color: f.color,
+      isTarget: f.isTarget,
+    }));
     this._flashIdx = 0;
-
-    // Randomize target color
-    const colorIdx = Math.floor(Math.random() * Config.cogTargetColors.length);
-    this.targetColor = Config.cogTargetColors[colorIdx];
-    this.targetColorName = Config.cogTargetColorNames[colorIdx];
-
-    // Randomize target count: 2-5
-    const targetCount = 2 + Math.floor(Math.random() * 4);
-
-    // Build color array: targetCount targets + remaining distractors
-    const colors = [];
-    for (let i = 0; i < targetCount; i++) {
-      colors.push(this.targetColor);
-    }
-    // Distractors: use the OTHER two colors
-    const distractorColors = Config.cogTargetColors.filter((_, i) => i !== colorIdx);
-    for (let i = colors.length; i < Config.cogFlashCount; i++) {
-      colors.push(distractorColors[Math.floor(Math.random() * distractorColors.length)]);
-    }
-    // Shuffle
-    for (let i = colors.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [colors[i], colors[j]] = [colors[j], colors[i]];
-    }
-
-    const gap = duration / (Config.cogFlashCount + 1);
-    for (let i = 0; i < Config.cogFlashCount; i++) {
-      const t = startTime + gap * (i + 1) + (Math.random() - 0.5) * gap * 0.3;
-      const num = Math.floor(Math.random() * 9) + 1;
-      this._schedule.push({
-        t,
-        number: num,
-        color: colors[i],
-        isTarget: colors[i] === this.targetColor,
-      });
-    }
-
     DataStore.cogFlashes = this._schedule;
   },
 
@@ -2276,25 +1120,16 @@ const CogTask = {
     this._flashEl.style.opacity = '0';
   },
 
-  /** Call every frame to check if a flash should fire */
   update(t) {
     if (!this._active || this._flashIdx >= this._schedule.length) return;
-
     const flash = this._schedule[this._flashIdx];
     if (t >= flash.t) {
-      // Show flash
       this._flashEl.textContent = flash.number;
       this._flashEl.style.color = flash.color;
       this._flashEl.style.opacity = '1';
-
-      // Record
-      flash.t = t; // update to exact time
-
-      // Hide after duration
-      setTimeout(() => {
-        this._flashEl.style.opacity = '0';
-      }, Config.cogFlashDuration);
-
+      flash.t = t;
+      const dur = Config.challenge ? Config.challenge.cogTask.flashDuration : 400;
+      setTimeout(() => { this._flashEl.style.opacity = '0'; }, dur);
       this._flashIdx++;
     }
   },
@@ -2302,25 +1137,21 @@ const CogTask = {
 
 
 // ─────────────────────────────────────────────
-// 11. PHASE CONTROLLER
+// 9. PHASE CONTROLLER
 // AGENT COOKIE CRUMB: State machine that
-// orchestrates the test phases. Each phase
-// feeds the data collection and perturbation
-// systems.
+// orchestrates the test phases. Now communicates
+// with the server to fetch challenges and submit
+// raw data for verification. Phase durations come
+// from server-provided challenge params.
 // ─────────────────────────────────────────────
 const PhaseCtrl = {
-  currentPhase: 'welcome', // welcome | free | tracking | dualtask | answer | computing | results
+  currentPhase: 'welcome',
   _phaseStart: 0,
-  _trackingPhaseStart: 0,  // absolute time when tracking began (persists into dualtask)
+  _trackingPhaseStart: 0,
+  _dualtaskPhaseStart: 0,
   _cursorX: 0,
   _cursorY: 0,
   _rafId: null,
-
-  // Shared target state — updated every render frame, read by Collector
-  // AGENT COOKIE CRUMB: Pointer events fire between render frames. We
-  // store the latest computed target/perturbation here so Collector can
-  // annotate data points with approximate target positions. The ~16ms
-  // lag is negligible vs human reaction times (~200ms).
   currentTargetX: 0,
   currentTargetY: 0,
   currentPertX: 0,
@@ -2329,7 +1160,6 @@ const PhaseCtrl = {
   currentPulseIdx: -1,
 
   init() {
-    // Track cursor position globally
     document.addEventListener('pointermove', (e) => {
       this._cursorX = e.clientX;
       this._cursorY = e.clientY;
@@ -2340,26 +1170,35 @@ const PhaseCtrl = {
     DataStore.clear();
     Renderer.clearTrail();
 
-    // Request DeviceMotion permission for accelerometer tremor detection.
-    // AGENT COOKIE CRUMB: This MUST happen inside a user-gesture handler
-    // (the button click). iOS 13+ blocks DeviceMotionEvent.requestPermission()
-    // if not triggered by a user gesture. We do it here before starting any
-    // phase so the accel listener is ready when tracking begins.
+    // Request DeviceMotion permission (must be in user gesture handler)
     await Collector.requestMotionPermission();
 
-    DataStore.startTime = performance.now();
+    // Fetch challenge from server
+    // AGENT COOKIE CRUMB: The server generates unique, randomized challenge
+    // params (probe frequencies, pulse schedule, path, cog task) for each
+    // session. The client receives only what it needs to render the task.
+    try {
+      const challengeData = await ServerAPI.fetchChallenge();
+      Config.token = challengeData.token;
+      Config.challenge = challengeData.challenge;
+    } catch (err) {
+      alert('Could not connect to CLNP server.\nStart it with: node server.js\n\nError: ' + err.message);
+      return;
+    }
 
+    // Re-init TargetPath with challenge padding
+    TargetPath.init(window.innerWidth, window.innerHeight);
+
+    DataStore.startTime = performance.now();
     document.getElementById('welcome').style.display = 'none';
     document.getElementById('results').style.display = 'none';
     document.getElementById('hud').style.display = 'flex';
-
     this._startPhase('free');
   },
 
   _startPhase(phase) {
     this.currentPhase = phase;
     this._phaseStart = performance.now();
-
     const label = document.getElementById('phaseLabel');
     const instr = document.getElementById('phaseInstruction');
 
@@ -2375,12 +1214,12 @@ const PhaseCtrl = {
         Collector.stop();
         Collector.start('tracking');
         this._trackingPhaseStart = performance.now();
-        PerturbEngine.initPulses(this._trackingPhaseStart, Config.trackingDuration);
+        PerturbEngine.initPulses(this._trackingPhaseStart);
         break;
       case 'dualtask':
         label.textContent = 'DUAL TASK';
-        // Generate schedule first so we know the target color
-        CogTask.generateSchedule(performance.now(), Config.dualTaskDuration);
+        this._dualtaskPhaseStart = performance.now();
+        CogTask.loadSchedule(this._dualtaskPhaseStart);
         instr.textContent = `Keep tracking — count the ${CogTask.targetColorName} numbers`;
         CogTask.start();
         break;
@@ -2389,48 +1228,79 @@ const PhaseCtrl = {
         CogTask.stop();
         document.getElementById('hud').style.display = 'none';
         document.getElementById('cogAnswer').style.display = 'flex';
-        // Update prompt to match the randomized target color
         document.getElementById('cogPrompt').innerHTML =
           `How many <strong style="color:${CogTask.targetColor}">${CogTask.targetColorName}</strong> numbers did you see?`;
         document.getElementById('cogInput').focus();
-        return; // no animation loop needed
+        return;
       case 'computing':
         document.getElementById('cogAnswer').style.display = 'none';
         document.getElementById('computing').style.display = 'flex';
-        // Run analysis asynchronously
-        setTimeout(() => {
-          const results = Analyzer.run();
-          const scoreResult = Scorer.score(results);
-          this._showResults(results, scoreResult);
-        }, 500);
+        document.getElementById('computingText').textContent = 'Verifying with server...';
+        // Submit raw data to server for verification
+        this._submitToServer();
         return;
       case 'results':
         return;
     }
 
-    // Start animation loop
     if (this._rafId) cancelAnimationFrame(this._rafId);
     this._tick();
+  },
+
+  async _submitToServer() {
+    // Build compact pointer array: [[t, x, y], ...]
+    const pointer = [];
+    for (const p of DataStore.freeMove) {
+      pointer.push([p.t, p.x, p.y]);
+    }
+    for (const p of DataStore.tracking) {
+      pointer.push([p.t, p.x, p.y]);
+    }
+
+    // Build compact accel array: [[t, ax, ay, az], ...]
+    const accel = DataStore.accelSamples.map(s => [s.t, s.ax, s.ay, s.az]);
+
+    const payload = {
+      token: Config.token,
+      canvas: { width: window.innerWidth, height: window.innerHeight },
+      inputMethod: DataStore.inputMethod,
+      cogAnswer: DataStore.cogAnswer,
+      phases: {
+        trackingStart: this._trackingPhaseStart,
+        dualtaskStart: this._dualtaskPhaseStart,
+        testEnd: performance.now(),
+      },
+      pointer,
+      accel,
+    };
+
+    try {
+      const result = await ServerAPI.submitVerification(payload);
+      this._showResults(result);
+    } catch (err) {
+      document.getElementById('computingText').textContent = 'Verification failed: ' + err.message;
+    }
   },
 
   _tick() {
     const now = performance.now();
     const elapsed = now - this._phaseStart;
     let duration, nextPhase;
+    const c = Config.challenge;
 
     switch (this.currentPhase) {
       case 'free':
-        duration = Config.freeMoveDuration;
+        duration = c.freeMoveDuration;
         nextPhase = 'tracking';
         Renderer.drawFreeMove(this._cursorX, this._cursorY);
         break;
       case 'tracking':
-        duration = Config.trackingDuration;
+        duration = c.trackingDuration;
         nextPhase = 'dualtask';
         this._tickTracking(now);
         break;
       case 'dualtask':
-        duration = Config.dualTaskDuration;
+        duration = c.dualtaskDuration;
         nextPhase = 'answer';
         this._tickTracking(now);
         CogTask.update(now);
@@ -2439,7 +1309,6 @@ const PhaseCtrl = {
         return;
     }
 
-    // Update timer
     const remaining = Math.max(0, (duration - elapsed) / 1000);
     document.getElementById('timer').textContent = remaining.toFixed(1);
 
@@ -2447,25 +1316,20 @@ const PhaseCtrl = {
       this._startPhase(nextPhase);
       return;
     }
-
     this._rafId = requestAnimationFrame(() => this._tick());
   },
 
   _tickTracking(now) {
-    // Compute target position using time since tracking began
     const trackingElapsed = now - this._phaseStart;
     const pathTime = this.currentPhase === 'dualtask'
-      ? (Config.trackingDuration + trackingElapsed)
+      ? (Config.challenge.trackingDuration + trackingElapsed)
       : trackingElapsed;
 
     const smooth = TargetPath.getSmooth(pathTime);
     const pert = PerturbEngine.get(now);
-
     const targetX = smooth.x + pert.x;
     const targetY = smooth.y + pert.y;
 
-    // Update shared state so Collector can read current values
-    // between render frames (at worst ~16ms stale)
     this.currentTargetX = targetX;
     this.currentTargetY = targetY;
     this.currentPertX = pert.x;
@@ -2476,21 +1340,21 @@ const PhaseCtrl = {
     Renderer.drawTracking(this._cursorX, this._cursorY, targetX, targetY, pert.x, pert.y, this.currentPhase);
   },
 
-  _showResults(results, scoreResult) {
+  _showResults(result) {
     document.getElementById('computing').style.display = 'none';
     document.getElementById('results').style.display = 'flex';
     this.currentPhase = 'results';
 
     // Verdict
     const verdictEl = document.getElementById('verdict');
-    verdictEl.textContent = scoreResult.verdict;
-    verdictEl.className = 'verdict ' + scoreResult.verdictClass;
+    verdictEl.textContent = result.verdict;
+    verdictEl.className = 'verdict ' + result.verdictClass;
 
     // Score ring
     const ringCanvas = document.getElementById('ringCanvas');
-    Renderer.drawScoreRing(ringCanvas, scoreResult.overall, scoreResult.verdictClass);
-    document.getElementById('scoreValue').textContent = Math.round(scoreResult.overall * 100) + '%';
-    document.getElementById('scoreValue').className = 'score-value ' + scoreResult.verdictClass;
+    Renderer.drawScoreRing(ringCanvas, result.overall, result.verdictClass);
+    document.getElementById('scoreValue').textContent = Math.round(result.overall * 100) + '%';
+    document.getElementById('scoreValue').className = 'score-value ' + result.verdictClass;
 
     // Metric cards
     const grid = document.getElementById('metricsGrid');
@@ -2500,8 +1364,8 @@ const PhaseCtrl = {
                          'crossAxis', 'oneOverF', 'cogInterference', 'minJerk'];
 
     for (const key of metricOrder) {
-      if (!scoreResult.scores[key]) continue;
-      const m = scoreResult.scores[key];
+      if (!result.scores[key]) continue;
+      const m = result.scores[key];
       const card = document.createElement('div');
       card.className = 'metric-card';
 
@@ -2516,43 +1380,6 @@ const PhaseCtrl = {
         <div class="metric-value ${scoreClass}">${m.score >= 0.6 ? 'HUMAN' : m.score >= 0.3 ? 'UNCERTAIN' : 'BOT-LIKE'}</div>
         <div class="metric-detail">${m.detail}</div>
       `;
-
-      // Add mini charts for certain metrics
-      if (key === 'tremor') {
-        // Show PSD from the best available tremor source
-        // AGENT COOKIE CRUMB: On mobile, accel PSD often has clearer tremor peak.
-        // Show accel PSD if it was the stronger signal, cursor PSD otherwise.
-        const accelStronger = results.accelTremor && results.accelTremor.valid &&
-          (!results.tremor || !results.tremor.valid ||
-           results.accelTremor.tremorRatio > results.tremor.tremorRatio);
-        const psdSource = accelStronger ? results.accelTremor : results.tremor;
-
-        if (psdSource && psdSource.psd) {
-          const chartCanvas = document.createElement('canvas');
-          card.appendChild(chartCanvas);
-          setTimeout(() => {
-            const psd = psdSource.psd;
-            const maxIdx = psd.freqs.findIndex(f => f > 20) || psd.power.length;
-            Renderer.drawMiniChart(chartCanvas, psd.power.slice(0, maxIdx), {
-              color: accelStronger ? '#ff66aa' : '#aa66ff',
-            });
-          }, 100);
-        }
-      }
-
-      if (key === 'oneOverF' && results.oneOverF && results.oneOverF.psd) {
-        const chartCanvas = document.createElement('canvas');
-        card.appendChild(chartCanvas);
-        setTimeout(() => {
-          const psd = results.oneOverF.psd;
-          const maxIdx = psd.freqs.findIndex(f => f > 15) || psd.power.length;
-          const logPower = psd.power.slice(1, maxIdx).map(p => Math.log10(p + 1e-10));
-          Renderer.drawMiniChart(chartCanvas, logPower, {
-            color: '#ffa726',
-          });
-        }, 100);
-      }
-
       grid.appendChild(card);
     }
 
@@ -2591,9 +1418,10 @@ const PhaseCtrl = {
       </p>
       <br>
       <p style="color: var(--text);">
-        <strong>Data collected:</strong> ${results.sampleCount} pointer samples at ~${Math.round(results.sampleRate)}Hz
-        via ${results.inputMethod} input${results.accelTremor && results.accelTremor.valid ? `, ${results.accelTremor.sampleCount} accel samples at ~${Math.round(results.accelTremor.sampleRate)}Hz` : ''}.
-        All analysis performed locally — no data leaves your browser.
+        <strong>Data collected:</strong> ${result.sampleCount} pointer samples at ~${result.sampleRate}Hz
+        via ${result.inputMethod} input. ${result.validCount}/8 metrics valid.
+        <br><strong>Verification:</strong> Analysis performed server-side with secret scoring thresholds.
+        Challenge ID: ${result.challengeId ? result.challengeId.slice(0, 8) : 'N/A'}...
       </p>
     `;
   },
@@ -2601,7 +1429,7 @@ const PhaseCtrl = {
 
 
 // ─────────────────────────────────────────────
-// 12. INITIALIZATION
+// 10. INITIALIZATION
 // ─────────────────────────────────────────────
 (function init() {
   const canvas = document.getElementById('trackCanvas');
@@ -2610,12 +1438,10 @@ const PhaseCtrl = {
   PhaseCtrl.init();
   CogTask.init(document.getElementById('cogFlash'));
 
-  // Start button
   document.getElementById('startBtn').addEventListener('click', async () => {
     await PhaseCtrl.startTest();
   });
 
-  // Cognitive answer submit
   document.getElementById('cogSubmit').addEventListener('click', () => {
     const val = parseInt(document.getElementById('cogInput').value);
     DataStore.cogAnswer = isNaN(val) ? null : val;
@@ -2623,12 +1449,9 @@ const PhaseCtrl = {
   });
 
   document.getElementById('cogInput').addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') {
-      document.getElementById('cogSubmit').click();
-    }
+    if (e.key === 'Enter') document.getElementById('cogSubmit').click();
   });
 
-  // Restart button
   document.getElementById('restartBtn').addEventListener('click', () => {
     document.getElementById('results').style.display = 'none';
     document.getElementById('welcome').style.display = 'flex';
