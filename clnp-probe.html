@@ -926,6 +926,14 @@ const DataStore = {
   cogFlashes: [],     // { t, number, color, isTarget }
   cogAnswer: null,
 
+  // Accelerometer samples (mobile tremor detection via DeviceMotion API)
+  // AGENT COOKIE CRUMB: On mobile, cursor-based tremor detection fails because
+  // touch digitizers spatially low-pass the 8-12Hz tremor signal. The device
+  // accelerometer measures hand vibration directly at 60-100Hz, bypassing the
+  // touch sensor entirely. We capture accel during tracking phases and analyze
+  // the PSD for tremor-band power as a supplementary/primary tremor source.
+  accelSamples: [],   // { t, ax, ay, az } — raw accelerometer during tracking
+
   // Metadata
   startTime: 0,
   inputMethod: 'unknown', // 'mouse', 'touch', 'trackpad'
@@ -938,6 +946,7 @@ const DataStore = {
     this.cogFlashes = [];
     this.cogAnswer = null;
     this.sampleRate = 0;
+    this.accelSamples = [];
   },
 };
 
@@ -954,6 +963,8 @@ const Collector = {
   _canvas: null,
   _active: false,
   _phase: null,  // 'free' | 'tracking'
+  _accelListener: null,
+  _motionPermitted: false,
 
   init(canvas) {
     this._canvas = canvas;
@@ -969,15 +980,72 @@ const Collector = {
     }, { passive: true });
   },
 
+  /**
+   * Request DeviceMotion permission (required on iOS 13+).
+   * AGENT COOKIE CRUMB: iOS 13+ requires an explicit user-gesture-triggered
+   * permission request for accelerometer/gyroscope access via DeviceMotionEvent.
+   * On Android and older iOS, it's available without permission. We call this
+   * during the "BEGIN TEST" click handler (which is a user gesture).
+   */
+  async requestMotionPermission() {
+    if (typeof DeviceMotionEvent !== 'undefined' &&
+        typeof DeviceMotionEvent.requestPermission === 'function') {
+      try {
+        const response = await DeviceMotionEvent.requestPermission();
+        this._motionPermitted = (response === 'granted');
+      } catch (_e) {
+        this._motionPermitted = false;
+      }
+    } else if (typeof DeviceMotionEvent !== 'undefined') {
+      // Non-iOS or older iOS: DeviceMotion available without permission
+      this._motionPermitted = true;
+    } else {
+      this._motionPermitted = false;
+    }
+    return this._motionPermitted;
+  },
+
   start(phase) {
     this._phase = phase;
     this._active = true;
     this._hasRawUpdate = false;
+    // Start accelerometer capture during tracking (includes dualtask continuation)
+    if (phase === 'tracking') this._startAccel();
   },
 
   stop() {
     this._active = false;
     this._phase = null;
+    this._stopAccel();
+  },
+
+  /**
+   * Start capturing accelerometer data for mobile tremor detection.
+   * AGENT COOKIE CRUMB: We capture accelerationIncludingGravity (wider device
+   * support) and subtract gravity in analysis via high-pass filtering. The raw
+   * accel magnitude captures hand tremor as device vibration at 8-12Hz.
+   */
+  _startAccel() {
+    if (!this._motionPermitted || this._accelListener) return;
+    this._accelListener = (e) => {
+      if (!this._active) return;
+      const acc = e.acceleration || e.accelerationIncludingGravity;
+      if (!acc) return;
+      DataStore.accelSamples.push({
+        t: performance.now(),
+        ax: acc.x || 0,
+        ay: acc.y || 0,
+        az: acc.z || 0,
+      });
+    };
+    window.addEventListener('devicemotion', this._accelListener);
+  },
+
+  _stopAccel() {
+    if (this._accelListener) {
+      window.removeEventListener('devicemotion', this._accelListener);
+      this._accelListener = null;
+    }
   },
 
   _onPointer(e) {
@@ -1047,6 +1115,7 @@ const Analyzer = {
     this.results = {};
     this.results.transferFn = this._analyzeTransferFunction();
     this.results.tremor = this._analyzeTremor();
+    this.results.accelTremor = this._analyzeAccelTremor();
     this.results.oneOverF = this._analyze1fNoise();
     this.results.signalDepNoise = this._analyzeSignalDepNoise();
     this.results.crossAxis = this._analyzeCrossAxis();
@@ -1207,6 +1276,78 @@ const Analyzer = {
       peakFrequency: peakFreq,
       tremorPower,
       totalPower,
+      psd: psdResult,
+    };
+  },
+
+  /**
+   * ANALYSIS 2b: Accelerometer-Based Tremor Detection (Mobile)
+   *
+   * AGENT COOKIE CRUMB: On mobile devices, cursor position tremor is unreliable
+   * because the capacitive touch digitizer spatially low-passes the tiny 8-12Hz
+   * displacements (finger contact area ~10mm vs tremor amplitude ~0.1mm).
+   *
+   * The device accelerometer bypasses this entirely — it measures inertial
+   * forces on the device body caused by hand tremor. When a user holds the
+   * phone and touches the screen, their physiological tremor vibrates the
+   * entire device at 8-12Hz. The accelerometer captures this at 60-100Hz
+   * with sub-mG resolution, far exceeding what touch position can resolve.
+   *
+   * We compute the PSD of high-pass-filtered accel magnitude and look for
+   * the same 8-12Hz tremor band power ratio used in cursor-based detection.
+   */
+  _analyzeAccelTremor() {
+    const samples = DataStore.accelSamples;
+    if (samples.length < 64) return { valid: false, reason: 'Insufficient accelerometer data' };
+
+    // Estimate accelerometer sample rate
+    const dts = [];
+    for (let i = 1; i < Math.min(samples.length, 500); i++) {
+      dts.push(samples[i].t - samples[i - 1].t);
+    }
+    const avgDt = dts.reduce((a, b) => a + b, 0) / dts.length;
+    const rate = avgDt > 0 ? 1000 / avgDt : 60;
+
+    if (rate < 20) return { valid: false, reason: 'Accel sample rate too low for tremor' };
+
+    // Compute acceleration magnitude (captures tremor in all axes)
+    const magnitudes = samples.map(s => Math.sqrt(s.ax ** 2 + s.ay ** 2 + s.az ** 2));
+    const timestamps = samples.map(s => s.t);
+
+    // Resample to uniform rate for FFT
+    const targetRate = Math.min(rate, 100);
+    const resampled = MathEngine.resample(magnitudes, timestamps, targetRate);
+    if (resampled.values.length < 64) return { valid: false, reason: 'Too few resampled accel points' };
+
+    // High-pass filter: remove gravity and slow drift via moving average subtraction
+    const smoothed = this._movingAvg(resampled.values, Math.round(targetRate / 3));
+    const residual = resampled.values.map((v, i) => v - (smoothed[i] || 0));
+
+    // PSD of high-passed accel magnitude
+    const psdResult = MathEngine.psd(residual, targetRate);
+
+    // Tremor band power
+    let tremorPower = 0, totalPower = 0, peakFreq = 0, peakPow = 0;
+    for (let i = 0; i < psdResult.freqs.length; i++) {
+      const f = psdResult.freqs[i];
+      const p = psdResult.power[i];
+      if (f > 1) totalPower += p;
+      if (f >= Config.tremorBandLow && f <= Config.tremorBandHigh) {
+        tremorPower += p;
+        if (p > peakPow) { peakPow = p; peakFreq = f; }
+      }
+    }
+
+    const tremorRatio = totalPower > 0 ? tremorPower / totalPower : 0;
+
+    return {
+      valid: true,
+      tremorRatio,
+      peakFrequency: peakFreq,
+      tremorPower,
+      totalPower,
+      sampleRate: rate,
+      sampleCount: samples.length,
       psd: psdResult,
     };
   },
@@ -1678,15 +1819,44 @@ const Scorer = {
     }
 
     // 2. Physiological Tremor (weight: 2.5)
-    if (results.tremor && results.tremor.valid) {
-      const tr = results.tremor;
-      // Tremor ratio should be above minimum threshold
-      let s = Math.min(1, tr.tremorRatio / (Config.humanTremorRatioMin * 3));
-      // Bonus if peak is in the right frequency range
-      if (tr.peakFrequency >= 7 && tr.peakFrequency <= 13) s = Math.min(1, s + 0.2);
-      scores.tremor = { score: s, weight: 2.5, label: 'Physiological Tremor',
-        detail: `Ratio: ${(tr.tremorRatio * 100).toFixed(2)}%, Peak: ${tr.peakFrequency.toFixed(1)}Hz` };
-      weightedSum += s * 2.5; totalWeight += 2.5; validCount++;
+    // AGENT COOKIE CRUMB: On mobile (touch input), cursor-based tremor detection
+    // is unreliable because the touch digitizer spatially low-passes tremor.
+    // The device accelerometer captures hand tremor at 8-12Hz via inertial
+    // measurement. We compute scores from BOTH sources and use the stronger
+    // signal, giving mobile devices a fair chance at tremor detection.
+    {
+      const hasCursor = results.tremor && results.tremor.valid;
+      const hasAccel = results.accelTremor && results.accelTremor.valid;
+
+      if (hasCursor || hasAccel) {
+        // Cursor-based tremor score
+        let cursorScore = 0;
+        let cursorDetail = '';
+        if (hasCursor) {
+          const tr = results.tremor;
+          cursorScore = Math.min(1, tr.tremorRatio / (Config.humanTremorRatioMin * 3));
+          if (tr.peakFrequency >= 7 && tr.peakFrequency <= 13) cursorScore = Math.min(1, cursorScore + 0.2);
+          cursorDetail = `Cursor: ${(tr.tremorRatio * 100).toFixed(2)}%@${tr.peakFrequency.toFixed(1)}Hz`;
+        }
+
+        // Accelerometer-based tremor score
+        let accelScore = 0;
+        let accelDetail = '';
+        if (hasAccel) {
+          const at = results.accelTremor;
+          accelScore = Math.min(1, at.tremorRatio / (Config.humanTremorRatioMin * 3));
+          if (at.peakFrequency >= 7 && at.peakFrequency <= 13) accelScore = Math.min(1, accelScore + 0.2);
+          accelDetail = `Accel: ${(at.tremorRatio * 100).toFixed(2)}%@${at.peakFrequency.toFixed(1)}Hz (${at.sampleCount} samples, ${Math.round(at.sampleRate)}Hz)`;
+        }
+
+        // Use whichever source has the stronger tremor signal
+        const s = Math.max(cursorScore, accelScore);
+        const source = accelScore > cursorScore ? 'accelerometer' : 'cursor';
+        const detail = [cursorDetail, accelDetail].filter(Boolean).join(' | ') + ` [best: ${source}]`;
+
+        scores.tremor = { score: s, weight: 2.5, label: 'Physiological Tremor', detail };
+        weightedSum += s * 2.5; totalWeight += 2.5; validCount++;
+      }
     }
 
     // 3. 1/f Noise (weight: 2)
@@ -2156,9 +2326,17 @@ const PhaseCtrl = {
     }, { passive: true });
   },
 
-  startTest() {
+  async startTest() {
     DataStore.clear();
     Renderer.clearTrail();
+
+    // Request DeviceMotion permission for accelerometer tremor detection.
+    // AGENT COOKIE CRUMB: This MUST happen inside a user-gesture handler
+    // (the button click). iOS 13+ blocks DeviceMotionEvent.requestPermission()
+    // if not triggered by a user gesture. We do it here before starting any
+    // phase so the accel listener is ready when tracking begins.
+    await Collector.requestMotionPermission();
+
     DataStore.startTime = performance.now();
 
     document.getElementById('welcome').style.display = 'none';
@@ -2330,17 +2508,26 @@ const PhaseCtrl = {
       `;
 
       // Add mini charts for certain metrics
-      if (key === 'tremor' && results.tremor && results.tremor.psd) {
-        const chartCanvas = document.createElement('canvas');
-        card.appendChild(chartCanvas);
-        setTimeout(() => {
-          const psd = results.tremor.psd;
-          // Only show up to 20Hz
-          const maxIdx = psd.freqs.findIndex(f => f > 20) || psd.power.length;
-          Renderer.drawMiniChart(chartCanvas, psd.power.slice(0, maxIdx), {
-            color: '#aa66ff',
-          });
-        }, 100);
+      if (key === 'tremor') {
+        // Show PSD from the best available tremor source
+        // AGENT COOKIE CRUMB: On mobile, accel PSD often has clearer tremor peak.
+        // Show accel PSD if it was the stronger signal, cursor PSD otherwise.
+        const accelStronger = results.accelTremor && results.accelTremor.valid &&
+          (!results.tremor || !results.tremor.valid ||
+           results.accelTremor.tremorRatio > results.tremor.tremorRatio);
+        const psdSource = accelStronger ? results.accelTremor : results.tremor;
+
+        if (psdSource && psdSource.psd) {
+          const chartCanvas = document.createElement('canvas');
+          card.appendChild(chartCanvas);
+          setTimeout(() => {
+            const psd = psdSource.psd;
+            const maxIdx = psd.freqs.findIndex(f => f > 20) || psd.power.length;
+            Renderer.drawMiniChart(chartCanvas, psd.power.slice(0, maxIdx), {
+              color: accelStronger ? '#ff66aa' : '#aa66ff',
+            });
+          }, 100);
+        }
       }
 
       if (key === 'oneOverF' && results.oneOverF && results.oneOverF.psd) {
@@ -2376,7 +2563,9 @@ const PhaseCtrl = {
         1. <strong>Transfer Function</strong> — Your motor system's frequency response. Humans show
         gain rolloff above 3-4Hz and increasing phase delay (neural conduction).<br>
         2. <strong>Physiological Tremor</strong> — 8-12Hz involuntary oscillation from motor neuron
-        firing, present in all humans, absent in API-driven cursor control.<br>
+        firing, present in all humans, absent in API-driven cursor control.
+        On mobile, the device accelerometer supplements cursor data to detect hand tremor
+        via inertial measurement.<br>
         3. <strong>1/f Noise</strong> — Biological control systems produce pink noise (power ∝ 1/f).
         Bots produce white noise or no noise.<br>
         4. <strong>Signal-Dependent Noise</strong> — Human motor variability scales with movement
@@ -2392,8 +2581,9 @@ const PhaseCtrl = {
       </p>
       <br>
       <p style="color: var(--text);">
-        <strong>Data collected:</strong> ${results.sampleCount} samples at ~${Math.round(results.sampleRate)}Hz
-        via ${results.inputMethod} input. All analysis performed locally — no data leaves your browser.
+        <strong>Data collected:</strong> ${results.sampleCount} pointer samples at ~${Math.round(results.sampleRate)}Hz
+        via ${results.inputMethod} input${results.accelTremor && results.accelTremor.valid ? `, ${results.accelTremor.sampleCount} accel samples at ~${Math.round(results.accelTremor.sampleRate)}Hz` : ''}.
+        All analysis performed locally — no data leaves your browser.
       </p>
     `;
   },
@@ -2411,8 +2601,8 @@ const PhaseCtrl = {
   CogTask.init(document.getElementById('cogFlash'));
 
   // Start button
-  document.getElementById('startBtn').addEventListener('click', () => {
-    PhaseCtrl.startTest();
+  document.getElementById('startBtn').addEventListener('click', async () => {
+    await PhaseCtrl.startTest();
   });
 
   // Cognitive answer submit
