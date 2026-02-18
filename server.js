@@ -491,16 +491,24 @@ function generateEmbedChallenge() {
   const challengeId = crypto.randomBytes(16).toString("hex");
   const now = Date.now();
 
-  // Same probe frequency pool, smaller amplitudes (1-2px)
+  // Sub-perceptual probe amplitudes: 0.15-0.35px per probe.
+  // With 5 probes at different frequencies, peak sum ≈ 1.0-1.75px — below
+  // conscious perception threshold (~2px on standard displays). RMS displacement
+  // is ~0.5px. Browsers render sub-pixel CSS transforms accurately, and 500+
+  // samples over 8s hover gives the FFT enough data to extract coherent signal
+  // at these amplitudes. The goal: zero visual artifact, measurable visuomotor coupling.
   const probeFreqsPicked = pickRandom(FREQ_POOL, 5).sort((a, b) => a - b);
   const probes = probeFreqsPicked.map(freq => ({
     freq,
-    ampX: +(randRange(0.8, 2.0)).toFixed(2),
-    ampY: +(randRange(0.3, 1.0)).toFixed(2),
+    ampX: +(randRange(0.15, 0.35)).toFixed(3),
+    ampY: +(randRange(0.05, 0.15)).toFixed(3),
     phaseOffset: Math.PI / 3 + randRange(-0.3, 0.3),
   }));
 
-  // Embed pulses: spaced every ~2s of cumulative hover time, amplitude 3-5px
+  // Embed pulses: 1.0-2.0px amplitude (was 3-5px). At ~0.3-0.7mm on screen,
+  // this is below conscious detection but within the visuomotor system's
+  // sensitivity range. The unconscious correction arc still produces measurable
+  // phase delay and cross-axis coupling. Spaced every ~2s of cumulative hover time.
   const pulseCount = Math.floor(randRange(4, 6));
   const pulseSpacing = 2000; // ms of hover time between pulses
   const pulseHoldDuration = Math.round(randRange(400, 600));
@@ -511,7 +519,7 @@ function generateEmbedChallenge() {
     const dir = (i % 3 === 2) ? -1 : 1;
     pulses.push({
       hoverTimeMs,
-      ampX: +(randRange(3, 5)).toFixed(1) * dir,
+      ampX: +(randRange(1.0, 2.0)).toFixed(2) * dir,
       ampY: 0,
     });
   }
