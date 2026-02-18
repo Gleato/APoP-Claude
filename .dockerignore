@@ -1,0 +1,7 @@
+.git
+.DS_Store
+.claude
+bot-test.js
+node_modules
+data
+*.md

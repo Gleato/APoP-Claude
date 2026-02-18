@@ -13,9 +13,16 @@
  *   POST /api/embed/challenge  — Generate embed challenge (smaller perturbations)
  *   POST /api/embed/verify     — Verify embed browsing data (7 metrics, no cognitive)
  *   GET  /api/health           — Health check
+ *   GET  /api/admin/stats      — Aggregated session stats (auth required)
+ *   GET  /api/admin/sessions   — Paginated session list (auth required)
+ *   GET  /api/admin/session/:id — Full session detail (auth required)
+ *   GET  /admin                — Admin dashboard HTML (auth required)
  *   GET  /                     — Serve clnp-probe.html
  *   GET  /clnp-embed.js        — Serve embed client library
  *   GET  /clnp-embed-demo.html — Serve embed demo page
+ *
+ * Every verification (standalone + embed) logs a session record to
+ * data/sessions.jsonl for ML training data collection.
  */
 
 "use strict";
@@ -34,6 +41,15 @@ const ROOT = __dirname;
 const CHALLENGE_TTL_MS = Number(process.env.CHALLENGE_TTL_MS || 180000);
 const CLEANUP_INTERVAL_MS = 30000;
 const MAX_BODY_BYTES = 2 * 1024 * 1024; // 2MB — enough for high-res pointer data
+
+// ─── DATA COLLECTION CONFIG ────────────────────────────────
+// AGENT COOKIE CRUMB: Session data is logged to JSONL for ML training.
+// Each verification (standalone + embed) appends one line to sessions.jsonl.
+// Data lives on a persistent Fly.io volume (/data) in production.
+// CLNP_ADMIN_TOKEN gates all admin endpoints — no token = no access.
+const DATA_DIR = process.env.CLNP_DATA_DIR || path.join(__dirname, "data");
+const SESSIONS_FILE = path.join(DATA_DIR, "sessions.jsonl");
+const CLNP_ADMIN_TOKEN = process.env.CLNP_ADMIN_TOKEN || null;
 
 // HMAC secret for signing tokens and receipts
 const secretString = process.env.CLNP_SECRET || crypto.randomBytes(32).toString("hex");
@@ -84,6 +100,190 @@ function verifyToken(token) {
 }
 
 
+// ─── IP HASHING & DATA COLLECTION ───────────────────────────
+// AGENT COOKIE CRUMB: IP addresses are hashed with the server secret so
+// we can deduplicate users without storing PII. The hash is truncated to
+// 16 hex chars — enough for uniqueness, not reversible to the original IP.
+
+function getClientIP(req) {
+  // Fly.io, Cloudflare, and other proxies set these headers
+  const cfIP = req.headers["cf-connecting-ip"];
+  if (cfIP) return cfIP.split(",")[0].trim();
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) return xff.split(",")[0].trim();
+  return req.socket.remoteAddress || "unknown";
+}
+
+function hashIP(ip) {
+  return crypto.createHmac("sha256", HMAC_SECRET)
+    .update(ip)
+    .digest("hex")
+    .slice(0, 16);
+}
+
+let dataDirectoryReady = false;
+
+function ensureDataDirectory() {
+  if (dataDirectoryReady) return;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    dataDirectoryReady = true;
+  } catch (err) {
+    console.error("[clnp] Failed to create data directory:", err.message);
+  }
+}
+
+/**
+ * Log a verification session to JSONL for ML training data collection.
+ * Called from both handleVerify and handleEmbedVerify after analysis.
+ * Each line is one self-contained JSON object — no external schema dependency.
+ *
+ * @param {Object} record - Session data to log
+ */
+function logSession(record) {
+  try {
+    ensureDataDirectory();
+    fs.appendFileSync(SESSIONS_FILE, JSON.stringify(record) + "\n");
+  } catch (err) {
+    console.error("[clnp] Failed to log session:", err.message);
+  }
+}
+
+
+// ─── ADMIN AUTHENTICATION ───────────────────────────────────
+// AGENT COOKIE CRUMB: Admin endpoints require CLNP_ADMIN_TOKEN.
+// Token can be passed via Authorization header or ?token= query param.
+// If CLNP_ADMIN_TOKEN is not set, all admin endpoints return 503 (not configured).
+// Uses timing-safe comparison to prevent timing attacks on the token.
+
+function authenticateAdmin(req, url) {
+  if (!CLNP_ADMIN_TOKEN) return { ok: false, status: 503, error: "admin_not_configured" };
+
+  // Check Authorization header first
+  const authHeader = req.headers["authorization"];
+  let token = null;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    token = authHeader.slice(7);
+  }
+  // Fall back to query param
+  if (!token) {
+    token = url.searchParams.get("token");
+  }
+  if (!token) return { ok: false, status: 401, error: "missing_token" };
+
+  // Timing-safe comparison
+  const tokenBuf = Buffer.from(token, "utf8");
+  const expectedBuf = Buffer.from(CLNP_ADMIN_TOKEN, "utf8");
+  if (tokenBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(tokenBuf, expectedBuf)) {
+    return { ok: false, status: 401, error: "invalid_token" };
+  }
+
+  return { ok: true };
+}
+
+
+// ─── ADMIN DATA HELPERS ─────────────────────────────────────
+// AGENT COOKIE CRUMB: Admin endpoints read sessions.jsonl line by line.
+// This is intentionally simple (no database) — JSONL is append-only,
+// survives crashes, and is trivial to export for ML training.
+
+function readAllSessions() {
+  try {
+    if (!fs.existsSync(SESSIONS_FILE)) return [];
+    const content = fs.readFileSync(SESSIONS_FILE, "utf8").trim();
+    if (!content) return [];
+    return content.split("\n").map(line => {
+      try { return JSON.parse(line); } catch (_e) { return null; }
+    }).filter(Boolean);
+  } catch (_err) {
+    return [];
+  }
+}
+
+function computeAdminStats(sessions) {
+  const now = Date.now();
+  const todayStart = new Date().setHours(0, 0, 0, 0);
+  const thirtyDaysAgo = now - 30 * 24 * 60 * 60 * 1000;
+  const oneHourAgo = now - 60 * 60 * 1000;
+
+  const total = sessions.length;
+  const today = sessions.filter(s => s.ts >= todayStart).length;
+  const recentHour = sessions.filter(s => s.ts >= oneHourAgo).length;
+
+  // By day (last 30 days)
+  const byDay = {};
+  for (let d = 0; d < 30; d++) {
+    const date = new Date(now - d * 24 * 60 * 60 * 1000);
+    const key = date.toISOString().slice(0, 10);
+    byDay[key] = 0;
+  }
+  for (const s of sessions) {
+    if (s.ts < thirtyDaysAgo) continue;
+    const key = new Date(s.ts).toISOString().slice(0, 10);
+    if (key in byDay) byDay[key]++;
+  }
+
+  // By device type
+  const byDevice = {};
+  for (const s of sessions) {
+    const dev = s.inputMethod || "unknown";
+    byDevice[dev] = (byDevice[dev] || 0) + 1;
+  }
+
+  // By verdict class
+  const byVerdict = { "score-human": 0, "score-uncertain": 0, "score-bot": 0 };
+  for (const s of sessions) {
+    const vc = s.verdictClass || "score-bot";
+    byVerdict[vc] = (byVerdict[vc] || 0) + 1;
+  }
+
+  // By mode
+  const byMode = {};
+  for (const s of sessions) {
+    const mode = s.mode || "standalone";
+    byMode[mode] = (byMode[mode] || 0) + 1;
+  }
+
+  // Score distribution (10 buckets: 0-10%, 10-20%, ..., 90-100%)
+  const scoreDistribution = new Array(10).fill(0);
+  for (const s of sessions) {
+    const bucket = Math.min(9, Math.floor((s.overall || 0) * 10));
+    scoreDistribution[bucket]++;
+  }
+
+  // Per-metric averages by device type
+  const metricSums = {};
+  const metricCounts = {};
+  for (const s of sessions) {
+    const dev = s.inputMethod || "unknown";
+    if (!metricSums[dev]) { metricSums[dev] = {}; metricCounts[dev] = {}; }
+    if (s.scores) {
+      for (const [key, val] of Object.entries(s.scores)) {
+        const score = typeof val === "object" ? val.score : val;
+        if (typeof score === "number") {
+          metricSums[dev][key] = (metricSums[dev][key] || 0) + score;
+          metricCounts[dev][key] = (metricCounts[dev][key] || 0) + 1;
+        }
+      }
+    }
+  }
+  const metricAverages = {};
+  for (const dev of Object.keys(metricSums)) {
+    metricAverages[dev] = {};
+    for (const key of Object.keys(metricSums[dev])) {
+      metricAverages[dev][key] = metricCounts[dev][key] > 0
+        ? +(metricSums[dev][key] / metricCounts[dev][key]).toFixed(3) : 0;
+    }
+  }
+
+  return {
+    total, today, recentRate: recentHour,
+    byDay, byDevice, byVerdict, byMode,
+    scoreDistribution, metricAverages,
+  };
+}
+
+
 // ─── HTTP HELPERS ───────────────────────────────────────────
 
 function json(res, statusCode, body) {
@@ -92,7 +292,7 @@ function json(res, statusCode, body) {
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
     "X-Content-Type-Options": "nosniff",
   });
   res.end(JSON.stringify(body));
@@ -441,6 +641,25 @@ async function handleVerify(req, res) {
     `${result.verdict} (${Math.round(result.overall * 100)}%) ` +
     `[${result.sampleCount} samples, ${result.sampleRate}Hz, ${rawData.inputMethod}]`);
 
+  // Log session for ML data collection
+  logSession({
+    id: crypto.randomBytes(8).toString("hex"),
+    ts: Date.now(),
+    tsISO: new Date().toISOString(),
+    mode: "standalone",
+    challengeId: challenge.challengeId,
+    inputMethod: result.inputMethod,
+    overall: result.overall,
+    verdict: result.verdict,
+    verdictClass: result.verdictClass,
+    scores: result.scores,
+    sampleRate: result.sampleRate,
+    sampleCount: result.sampleCount,
+    validCount: result.validCount,
+    ipHash: hashIP(getClientIP(req)),
+    userAgent: req.headers["user-agent"] || "unknown",
+  });
+
   json(res, 200, {
     ok: true,
     challengeId: challenge.challengeId,
@@ -548,6 +767,29 @@ async function handleEmbedVerify(req, res) {
     `[${result.sampleCount} samples, ${result.sampleRate}Hz, ` +
     `${result.totalHoverTime}ms hover, ${result.uniqueElements} elements, ${rawData.inputMethod}]`);
 
+  // Log session for ML data collection
+  logSession({
+    id: crypto.randomBytes(8).toString("hex"),
+    ts: Date.now(),
+    tsISO: new Date().toISOString(),
+    mode: "embed",
+    challengeId: challenge.challengeId,
+    inputMethod: result.inputMethod,
+    overall: result.overall,
+    verdict: result.verdict,
+    verdictClass: result.verdictClass,
+    scores: result.scores,
+    sampleRate: result.sampleRate,
+    sampleCount: result.sampleCount,
+    totalHoverTime: result.totalHoverTime,
+    uniqueElements: result.uniqueElements,
+    plausible: result.plausible,
+    validCount: result.validCount,
+    ipHash: hashIP(getClientIP(req)),
+    userAgent: req.headers["user-agent"] || "unknown",
+    deviceProfile: body.deviceProfile || null,
+  });
+
   json(res, 200, {
     ok: true,
     challengeId: challenge.challengeId,
@@ -594,7 +836,7 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(204, {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
       "Access-Control-Max-Age": "86400",
     });
     res.end();
@@ -641,6 +883,67 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ─── ADMIN ENDPOINTS ──────────────────────────────────────
+  // AGENT COOKIE CRUMB: All /admin and /api/admin/* routes require
+  // CLNP_ADMIN_TOKEN via Bearer header or ?token= query param.
+  // These endpoints read the JSONL session log for stats/browsing.
+
+  if (method === "GET" && url.pathname === "/admin") {
+    const auth = authenticateAdmin(req, url);
+    if (!auth.ok) { json(res, auth.status, { ok: false, error: auth.error }); return; }
+    serveFile(res, path.join(ROOT, "clnp-admin.html"), "text/html; charset=utf-8");
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/api/admin/stats") {
+    const auth = authenticateAdmin(req, url);
+    if (!auth.ok) { json(res, auth.status, { ok: false, error: auth.error }); return; }
+    const sessions = readAllSessions();
+    const stats = computeAdminStats(sessions);
+    json(res, 200, { ok: true, ...stats });
+    return;
+  }
+
+  if (method === "GET" && url.pathname === "/api/admin/sessions") {
+    const auth = authenticateAdmin(req, url);
+    if (!auth.ok) { json(res, auth.status, { ok: false, error: auth.error }); return; }
+    const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit")) || 50));
+    const offset = Math.max(0, Number(url.searchParams.get("offset")) || 0);
+    const sessions = readAllSessions();
+    // Return newest first, lightweight (flatten scores to key→number)
+    const sorted = sessions.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+    const page = sorted.slice(offset, offset + limit).map(s => {
+      const flatScores = {};
+      if (s.scores) {
+        for (const [k, v] of Object.entries(s.scores)) {
+          flatScores[k] = typeof v === "object" ? +(v.score || 0).toFixed(3) : +(v || 0).toFixed(3);
+        }
+      }
+      return {
+        id: s.id, ts: s.ts, tsISO: s.tsISO, mode: s.mode,
+        inputMethod: s.inputMethod, overall: s.overall,
+        verdict: s.verdict, verdictClass: s.verdictClass,
+        scores: flatScores, sampleRate: s.sampleRate,
+        sampleCount: s.sampleCount, validCount: s.validCount,
+        ipHash: s.ipHash,
+      };
+    });
+    json(res, 200, { ok: true, total: sessions.length, offset, limit, sessions: page });
+    return;
+  }
+
+  if (method === "GET" && url.pathname.startsWith("/api/admin/session/")) {
+    const auth = authenticateAdmin(req, url);
+    if (!auth.ok) { json(res, auth.status, { ok: false, error: auth.error }); return; }
+    const sessionId = url.pathname.split("/api/admin/session/")[1];
+    if (!sessionId) { json(res, 400, { ok: false, error: "missing_session_id" }); return; }
+    const sessions = readAllSessions();
+    const session = sessions.find(s => s.id === sessionId);
+    if (!session) { json(res, 404, { ok: false, error: "session_not_found" }); return; }
+    json(res, 200, { ok: true, session });
+    return;
+  }
+
   if (method === "GET" && url.pathname === "/favicon.ico") {
     res.writeHead(204, { "Cache-Control": "public, max-age=604800" });
     res.end();
@@ -669,4 +972,6 @@ setInterval(cleanupChallenges, CLEANUP_INTERVAL_MS).unref();
 server.listen(PORT, HOST, () => {
   console.log(`[clnp] Server listening on http://${HOST}:${PORT}`);
   console.log(`[clnp] Scoring thresholds are SERVER-SIDE ONLY — not sent to clients`);
+  console.log(`[clnp] Data directory: ${DATA_DIR}`);
+  console.log(`[clnp] Admin dashboard: ${CLNP_ADMIN_TOKEN ? "enabled (token set)" : "disabled (no CLNP_ADMIN_TOKEN)"}`);
 });

@@ -1,0 +1,45 @@
+# AGENT COOKIE CRUMB: Fly.io deployment config for CLNP.
+# Region: ord (Chicago) — central US, low latency to both coasts.
+# auto_stop_machines = "stop" + min_machines_running = 0 means ZERO COST
+# when idle (machine stops after no traffic). Cold start ~2s on first request.
+# Persistent volume clnp_data at /data stores sessions.jsonl across deploys.
+
+app = "clnp"
+primary_region = "ord"
+
+[build]
+
+[env]
+  PORT = "8080"
+  HOST = "0.0.0.0"
+  CLNP_DATA_DIR = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [http_service.concurrency]
+    type = "requests"
+    hard_limit = 250
+    soft_limit = 200
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+[mounts]
+  source = "clnp_data"
+  destination = "/data"
+
+[[checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/api/health"
+  port = 8080
+  timeout = "5s"
+  type = "http"

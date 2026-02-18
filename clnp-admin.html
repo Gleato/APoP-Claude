@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLNP Admin Dashboard</title>
+<!--
+  AGENT COOKIE CRUMB: Self-contained admin dashboard for CLNP data collection.
+  No external dependencies. Auth token from ?token= query param.
+  Fetches /api/admin/stats and /api/admin/sessions to render charts and tables.
+  Auto-refresh toggle (30s). Dark theme matching embed demo.
+-->
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0a0e17; --bg2: #111827; --bg3: #1f2937;
+    --fg: #e5e7eb; --fg2: #9ca3af; --fg3: #6b7280;
+    --accent: #60a5fa; --green: #34d399; --yellow: #fbbf24;
+    --red: #f87171; --purple: #a78bfa;
+    --border: #374151;
+  }
+  body {
+    font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+    background: var(--bg); color: var(--fg);
+    min-height: 100vh; line-height: 1.5;
+    font-size: 13px;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Login screen */
+  #login-screen {
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; flex-direction: column; gap: 16px;
+  }
+  #login-screen h1 { font-size: 20px; color: var(--accent); }
+  #login-screen input {
+    background: var(--bg2); border: 1px solid var(--border); color: var(--fg);
+    padding: 10px 16px; border-radius: 6px; font-family: inherit;
+    font-size: 14px; width: 300px; outline: none;
+  }
+  #login-screen input:focus { border-color: var(--accent); }
+  #login-screen button {
+    background: var(--accent); color: #000; border: none; padding: 10px 24px;
+    border-radius: 6px; font-family: inherit; font-size: 14px; cursor: pointer;
+    font-weight: 600;
+  }
+  #login-screen button:hover { opacity: 0.9; }
+  #login-screen .error { color: var(--red); font-size: 12px; }
+
+  /* Main layout */
+  #app { display: none; max-width: 1200px; margin: 0 auto; padding: 24px; }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 18px; color: var(--accent); }
+  .header-controls { display: flex; gap: 12px; align-items: center; }
+  .header-controls label { font-size: 12px; color: var(--fg2); cursor: pointer; }
+  .header-controls input[type="checkbox"] { margin-right: 4px; }
+  .refresh-btn {
+    background: var(--bg3); border: 1px solid var(--border); color: var(--fg);
+    padding: 6px 12px; border-radius: 4px; cursor: pointer; font-family: inherit;
+    font-size: 12px;
+  }
+  .refresh-btn:hover { border-color: var(--accent); }
+  .last-updated { font-size: 11px; color: var(--fg3); }
+
+  /* Grid */
+  .grid { display: grid; gap: 16px; margin-bottom: 24px; }
+  .grid-4 { grid-template-columns: repeat(4, 1fr); }
+  .grid-3 { grid-template-columns: repeat(3, 1fr); }
+  .grid-2 { grid-template-columns: repeat(2, 1fr); }
+  @media (max-width: 800px) {
+    .grid-4 { grid-template-columns: repeat(2, 1fr); }
+    .grid-3 { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  /* Cards */
+  .card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px;
+  }
+  .card h3 { font-size: 11px; color: var(--fg3); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .card .big { font-size: 28px; font-weight: 700; }
+  .card .sub { font-size: 11px; color: var(--fg2); margin-top: 4px; }
+
+  /* Stat card colors */
+  .card-human .big { color: var(--green); }
+  .card-uncertain .big { color: var(--yellow); }
+  .card-bot .big { color: var(--red); }
+
+  /* Section headers */
+  .section-title {
+    font-size: 14px; font-weight: 600; margin-bottom: 12px;
+    color: var(--fg); border-bottom: 1px solid var(--border);
+    padding-bottom: 8px;
+  }
+
+  /* Histogram */
+  .histogram { display: flex; align-items: flex-end; gap: 3px; height: 120px; }
+  .histogram .bar-wrap {
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    height: 100%; justify-content: flex-end;
+  }
+  .histogram .bar {
+    width: 100%; border-radius: 2px 2px 0 0; min-height: 2px;
+    transition: height 0.3s;
+  }
+  .histogram .bar-label {
+    font-size: 9px; color: var(--fg3); margin-top: 4px; text-align: center;
+  }
+  .histogram .bar-count {
+    font-size: 9px; color: var(--fg2); margin-bottom: 2px;
+  }
+
+  /* Day chart */
+  .day-chart { display: flex; flex-direction: column; gap: 2px; }
+  .day-row { display: flex; align-items: center; gap: 8px; }
+  .day-label { width: 70px; font-size: 10px; color: var(--fg3); text-align: right; }
+  .day-bar-wrap { flex: 1; height: 14px; background: var(--bg); border-radius: 2px; }
+  .day-bar { height: 100%; background: var(--accent); border-radius: 2px; transition: width 0.3s; min-width: 1px; }
+  .day-count { width: 30px; font-size: 10px; color: var(--fg2); }
+
+  /* Device bars */
+  .device-bars { display: flex; flex-direction: column; gap: 8px; }
+  .device-row { display: flex; align-items: center; gap: 8px; }
+  .device-label { width: 70px; font-size: 11px; color: var(--fg2); text-align: right; }
+  .device-bar-wrap { flex: 1; height: 20px; background: var(--bg); border-radius: 3px; }
+  .device-bar { height: 100%; border-radius: 3px; transition: width 0.3s; min-width: 2px; }
+  .device-count { width: 40px; font-size: 11px; color: var(--fg2); }
+
+  /* Metric averages table */
+  .metric-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .metric-table th {
+    text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
+    color: var(--fg3); font-size: 11px; text-transform: uppercase;
+  }
+  .metric-table td {
+    padding: 6px 8px; border-bottom: 1px solid var(--bg);
+  }
+  .metric-table tr:hover td { background: var(--bg3); }
+  .metric-cell { font-weight: 600; text-align: center; border-radius: 3px; padding: 2px 6px; }
+
+  /* Sessions table */
+  .sessions-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  .sessions-table th {
+    text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border);
+    color: var(--fg3); font-size: 10px; text-transform: uppercase;
+    position: sticky; top: 0; background: var(--bg2);
+  }
+  .sessions-table td { padding: 6px; border-bottom: 1px solid rgba(55,65,81,0.3); }
+  .sessions-table tr { cursor: pointer; }
+  .sessions-table tr:hover td { background: var(--bg3); }
+  .verdict-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 10px; font-weight: 600;
+  }
+  .verdict-badge.score-human { background: rgba(52,211,153,0.15); color: var(--green); }
+  .verdict-badge.score-uncertain { background: rgba(251,191,36,0.15); color: var(--yellow); }
+  .verdict-badge.score-bot { background: rgba(248,113,113,0.15); color: var(--red); }
+
+  /* Expanded row */
+  .detail-row { display: none; }
+  .detail-row.open { display: table-row; }
+  .detail-row td {
+    padding: 12px; background: var(--bg); border-bottom: 1px solid var(--border);
+  }
+  .detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+  .detail-metric {
+    background: var(--bg2); padding: 8px; border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  .detail-metric .label { font-size: 10px; color: var(--fg3); }
+  .detail-metric .value { font-size: 16px; font-weight: 700; margin-top: 2px; }
+  .detail-metric .info { font-size: 10px; color: var(--fg2); margin-top: 2px; word-break: break-all; }
+
+  /* Loading / empty states */
+  .loading { text-align: center; padding: 40px; color: var(--fg3); }
+  .empty { text-align: center; padding: 24px; color: var(--fg3); font-style: italic; }
+
+  /* Pagination */
+  .pagination {
+    display: flex; justify-content: center; gap: 8px; margin-top: 12px;
+  }
+  .pagination button {
+    background: var(--bg3); border: 1px solid var(--border); color: var(--fg);
+    padding: 4px 12px; border-radius: 4px; cursor: pointer; font-family: inherit;
+    font-size: 11px;
+  }
+  .pagination button:disabled { opacity: 0.3; cursor: default; }
+  .pagination button:hover:not(:disabled) { border-color: var(--accent); }
+  .pagination .page-info { font-size: 11px; color: var(--fg3); line-height: 28px; }
+</style>
+</head>
+<body>
+
+<!-- Login screen — shown when no token in URL -->
+<div id="login-screen">
+  <h1>CLNP Admin</h1>
+  <p style="color: var(--fg2); font-size: 12px;">Enter admin token to access the dashboard</p>
+  <input type="password" id="token-input" placeholder="Admin token" autofocus>
+  <button onclick="doLogin()">Login</button>
+  <div id="login-error" class="error"></div>
+</div>
+
+<!-- Main dashboard -->
+<div id="app">
+  <header>
+    <h1>CLNP Admin Dashboard</h1>
+    <div class="header-controls">
+      <span class="last-updated" id="last-updated"></span>
+      <label>
+        <input type="checkbox" id="auto-refresh" checked> Auto-refresh (30s)
+      </label>
+      <button class="refresh-btn" onclick="loadAll()">Refresh</button>
+    </div>
+  </header>
+
+  <!-- Stat cards -->
+  <div class="grid grid-4" id="stat-cards">
+    <div class="card"><h3>Total Sessions</h3><div class="big" id="stat-total">-</div></div>
+    <div class="card"><h3>Today</h3><div class="big" id="stat-today">-</div></div>
+    <div class="card"><h3>Rate / Hour</h3><div class="big" id="stat-rate">-</div></div>
+    <div class="card"><h3>Pass Rate</h3><div class="big" id="stat-pass">-</div></div>
+  </div>
+
+  <!-- Score distribution + Day chart -->
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>Score Distribution</h3>
+      <div class="histogram" id="score-histogram"></div>
+    </div>
+    <div class="card">
+      <h3>Sessions by Day (30d)</h3>
+      <div class="day-chart" id="day-chart"></div>
+    </div>
+  </div>
+
+  <!-- Verdict + Device breakdown -->
+  <div class="grid grid-2">
+    <div class="card">
+      <h3>Verdict Breakdown</h3>
+      <div class="grid grid-3" id="verdict-cards"></div>
+    </div>
+    <div class="card">
+      <h3>Device Breakdown</h3>
+      <div class="device-bars" id="device-bars"></div>
+    </div>
+  </div>
+
+  <!-- Per-metric averages -->
+  <div class="card" style="margin-bottom: 24px;">
+    <h3>Per-Metric Averages by Device</h3>
+    <div style="overflow-x: auto;">
+      <table class="metric-table" id="metric-table">
+        <thead><tr><th>Metric</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Sessions table -->
+  <div class="card">
+    <h3>Recent Sessions</h3>
+    <div style="overflow-x: auto;">
+      <table class="sessions-table" id="sessions-table">
+        <thead>
+          <tr>
+            <th>Time</th><th>Mode</th><th>Device</th>
+            <th>Score</th><th>Verdict</th><th>Metrics</th>
+            <th>Samples</th><th>IP</th>
+          </tr>
+        </thead>
+        <tbody id="sessions-tbody"></tbody>
+      </table>
+    </div>
+    <div class="pagination" id="pagination"></div>
+  </div>
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  // ─── AUTH ───────────────────────────────────────────────────
+  const params = new URLSearchParams(window.location.search);
+  let TOKEN = params.get("token") || "";
+
+  if (TOKEN) {
+    document.getElementById("login-screen").style.display = "none";
+    document.getElementById("app").style.display = "block";
+    loadAll();
+  }
+
+  window.doLogin = function() {
+    const input = document.getElementById("token-input");
+    TOKEN = input.value.trim();
+    if (!TOKEN) { showLoginError("Please enter a token"); return; }
+    // Test token with stats endpoint
+    apiFetch("/api/admin/stats").then(function(data) {
+      if (data && data.ok) {
+        document.getElementById("login-screen").style.display = "none";
+        document.getElementById("app").style.display = "block";
+        // Update URL without reload
+        window.history.replaceState({}, "", "?token=" + encodeURIComponent(TOKEN));
+        renderStats(data);
+        loadSessions();
+      } else {
+        showLoginError("Invalid token");
+      }
+    }).catch(function() { showLoginError("Connection failed"); });
+  };
+
+  document.getElementById("token-input").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") window.doLogin();
+  });
+
+  function showLoginError(msg) {
+    document.getElementById("login-error").textContent = msg;
+  }
+
+  // ─── API ────────────────────────────────────────────────────
+  function apiFetch(path) {
+    var sep = path.indexOf("?") >= 0 ? "&" : "?";
+    return fetch(path + sep + "token=" + encodeURIComponent(TOKEN))
+      .then(function(r) { return r.json(); })
+      .catch(function() { return { ok: false }; });
+  }
+
+  // ─── DATA LOADING ──────────────────────────────────────────
+  var sessionOffset = 0;
+  var sessionLimit = 50;
+
+  function loadAll() {
+    apiFetch("/api/admin/stats").then(renderStats);
+    loadSessions();
+    document.getElementById("last-updated").textContent =
+      "Updated: " + new Date().toLocaleTimeString();
+  }
+  window.loadAll = loadAll;
+
+  function loadSessions() {
+    apiFetch("/api/admin/sessions?limit=" + sessionLimit + "&offset=" + sessionOffset)
+      .then(renderSessions);
+  }
+
+  // ─── AUTO REFRESH ──────────────────────────────────────────
+  var refreshInterval = null;
+  function startAutoRefresh() {
+    stopAutoRefresh();
+    refreshInterval = setInterval(loadAll, 30000);
+  }
+  function stopAutoRefresh() {
+    if (refreshInterval) { clearInterval(refreshInterval); refreshInterval = null; }
+  }
+  document.getElementById("auto-refresh").addEventListener("change", function() {
+    if (this.checked) startAutoRefresh(); else stopAutoRefresh();
+  });
+  if (TOKEN) startAutoRefresh();
+
+  // ─── RENDER: STATS ─────────────────────────────────────────
+  function renderStats(data) {
+    if (!data || !data.ok) return;
+
+    // Stat cards
+    document.getElementById("stat-total").textContent = data.total.toLocaleString();
+    document.getElementById("stat-today").textContent = data.today.toLocaleString();
+    document.getElementById("stat-rate").textContent = data.recentRate;
+    var passRate = data.total > 0
+      ? ((data.byVerdict["score-human"] || 0) / data.total * 100).toFixed(1) + "%"
+      : "N/A";
+    document.getElementById("stat-pass").textContent = passRate;
+
+    // Score distribution histogram
+    renderHistogram(data.scoreDistribution);
+
+    // Day chart
+    renderDayChart(data.byDay);
+
+    // Verdict cards
+    renderVerdictCards(data.byVerdict, data.total);
+
+    // Device bars
+    renderDeviceBars(data.byDevice, data.total);
+
+    // Metric averages table
+    renderMetricTable(data.metricAverages);
+  }
+
+  // ─── RENDER: HISTOGRAM ──────────────────────────────────────
+  function renderHistogram(buckets) {
+    var container = document.getElementById("score-histogram");
+    var maxVal = Math.max.apply(null, buckets) || 1;
+    var labels = ["0-10", "10-20", "20-30", "30-40", "40-50", "50-60", "60-70", "70-80", "80-90", "90-100"];
+    // Color gradient: red to yellow to green
+    var colors = [
+      "#ef4444", "#f97316", "#f59e0b", "#eab308", "#84cc16",
+      "#22c55e", "#10b981", "#14b8a6", "#06b6d4", "#34d399"
+    ];
+    var html = "";
+    for (var i = 0; i < 10; i++) {
+      var pct = maxVal > 0 ? (buckets[i] / maxVal * 100) : 0;
+      html += '<div class="bar-wrap">' +
+        '<div class="bar-count">' + (buckets[i] || 0) + '</div>' +
+        '<div class="bar" style="height:' + Math.max(2, pct) + '%;background:' + colors[i] + '"></div>' +
+        '<div class="bar-label">' + labels[i] + '</div>' +
+        '</div>';
+    }
+    container.innerHTML = html;
+  }
+
+  // ─── RENDER: DAY CHART ──────────────────────────────────────
+  function renderDayChart(byDay) {
+    var container = document.getElementById("day-chart");
+    var entries = Object.entries(byDay).sort(function(a, b) { return a[0].localeCompare(b[0]); });
+    // Show last 14 days to keep it compact
+    entries = entries.slice(-14);
+    var maxVal = Math.max.apply(null, entries.map(function(e) { return e[1]; })) || 1;
+    var html = "";
+    for (var i = 0; i < entries.length; i++) {
+      var pct = (entries[i][1] / maxVal * 100);
+      var label = entries[i][0].slice(5); // MM-DD
+      html += '<div class="day-row">' +
+        '<span class="day-label">' + label + '</span>' +
+        '<div class="day-bar-wrap"><div class="day-bar" style="width:' + Math.max(1, pct) + '%"></div></div>' +
+        '<span class="day-count">' + entries[i][1] + '</span>' +
+        '</div>';
+    }
+    container.innerHTML = html;
+  }
+
+  // ─── RENDER: VERDICT CARDS ──────────────────────────────────
+  function renderVerdictCards(byVerdict, total) {
+    var container = document.getElementById("verdict-cards");
+    var items = [
+      { key: "score-human", label: "Human", cls: "card-human" },
+      { key: "score-uncertain", label: "Uncertain", cls: "card-uncertain" },
+      { key: "score-bot", label: "Bot", cls: "card-bot" },
+    ];
+    var html = "";
+    for (var i = 0; i < items.length; i++) {
+      var count = byVerdict[items[i].key] || 0;
+      var pct = total > 0 ? (count / total * 100).toFixed(1) : "0";
+      html += '<div class="card ' + items[i].cls + '">' +
+        '<h3>' + items[i].label + '</h3>' +
+        '<div class="big">' + count + '</div>' +
+        '<div class="sub">' + pct + '% of total</div>' +
+        '</div>';
+    }
+    container.innerHTML = html;
+  }
+
+  // ─── RENDER: DEVICE BARS ───────────────────────────────────
+  function renderDeviceBars(byDevice, total) {
+    var container = document.getElementById("device-bars");
+    var deviceColors = { mouse: "#60a5fa", touch: "#34d399", trackpad: "#a78bfa", unknown: "#6b7280" };
+    var entries = Object.entries(byDevice).sort(function(a, b) { return b[1] - a[1]; });
+    var maxVal = entries.length > 0 ? entries[0][1] : 1;
+    var html = "";
+    for (var i = 0; i < entries.length; i++) {
+      var pct = (entries[i][1] / maxVal * 100);
+      var color = deviceColors[entries[i][0]] || "#6b7280";
+      html += '<div class="device-row">' +
+        '<span class="device-label">' + entries[i][0] + '</span>' +
+        '<div class="device-bar-wrap"><div class="device-bar" style="width:' + Math.max(2, pct) + '%;background:' + color + '"></div></div>' +
+        '<span class="device-count">' + entries[i][1] + '</span>' +
+        '</div>';
+    }
+    container.innerHTML = html || '<div class="empty">No data</div>';
+  }
+
+  // ─── RENDER: METRIC TABLE ──────────────────────────────────
+  function renderMetricTable(metricAverages) {
+    var table = document.getElementById("metric-table");
+    var devices = Object.keys(metricAverages);
+    if (devices.length === 0) {
+      table.querySelector("tbody").innerHTML = '<tr><td colspan="4" class="empty">No data</td></tr>';
+      return;
+    }
+
+    // All metrics across all devices
+    var allMetrics = new Set();
+    for (var d = 0; d < devices.length; d++) {
+      for (var key in metricAverages[devices[d]]) allMetrics.add(key);
+    }
+    var metrics = Array.from(allMetrics).sort();
+
+    // Header
+    var headHtml = "<tr><th>Metric</th>";
+    for (var d = 0; d < devices.length; d++) headHtml += "<th>" + devices[d] + "</th>";
+    headHtml += "</tr>";
+    table.querySelector("thead").innerHTML = headHtml;
+
+    // Body
+    var bodyHtml = "";
+    for (var m = 0; m < metrics.length; m++) {
+      bodyHtml += "<tr><td>" + metrics[m] + "</td>";
+      for (var d = 0; d < devices.length; d++) {
+        var val = metricAverages[devices[d]][metrics[m]];
+        var display = typeof val === "number" ? val.toFixed(3) : "-";
+        var color = scoreColor(val);
+        bodyHtml += '<td><span class="metric-cell" style="color:' + color + '">' + display + '</span></td>';
+      }
+      bodyHtml += "</tr>";
+    }
+    table.querySelector("tbody").innerHTML = bodyHtml;
+  }
+
+  function scoreColor(val) {
+    if (typeof val !== "number") return "var(--fg3)";
+    if (val >= 0.65) return "var(--green)";
+    if (val >= 0.35) return "var(--yellow)";
+    return "var(--red)";
+  }
+
+  // ─── RENDER: SESSIONS TABLE ─────────────────────────────────
+  function renderSessions(data) {
+    if (!data || !data.ok) return;
+    var tbody = document.getElementById("sessions-tbody");
+
+    if (data.sessions.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No sessions yet</td></tr>';
+      renderPagination(0, 0, 0);
+      return;
+    }
+
+    var html = "";
+    for (var i = 0; i < data.sessions.length; i++) {
+      var s = data.sessions[i];
+      var time = s.tsISO ? new Date(s.tsISO).toLocaleString() : "?";
+      var scoreStr = typeof s.overall === "number" ? (s.overall * 100).toFixed(1) + "%" : "?";
+      var verdictShort = "?";
+      if (s.verdictClass === "score-human") verdictShort = "Human";
+      else if (s.verdictClass === "score-uncertain") verdictShort = "Uncertain";
+      else if (s.verdictClass === "score-bot") verdictShort = "Bot";
+
+      // Compact score bars for metrics
+      var metricBars = "";
+      if (s.scores) {
+        var scoreKeys = Object.keys(s.scores);
+        for (var j = 0; j < scoreKeys.length; j++) {
+          var sc = s.scores[scoreKeys[j]];
+          var c = scoreColor(sc);
+          metricBars += '<span style="display:inline-block;width:8px;height:8px;border-radius:1px;background:' + c + ';margin-right:1px" title="' + scoreKeys[j] + ': ' + (sc * 100).toFixed(0) + '%"></span>';
+        }
+      }
+
+      html += '<tr onclick="toggleDetail(\'' + s.id + '\', this)">' +
+        '<td>' + time + '</td>' +
+        '<td>' + (s.mode || "standalone") + '</td>' +
+        '<td>' + (s.inputMethod || "?") + '</td>' +
+        '<td style="font-weight:600;color:' + scoreColor(s.overall) + '">' + scoreStr + '</td>' +
+        '<td><span class="verdict-badge ' + (s.verdictClass || "") + '">' + verdictShort + '</span></td>' +
+        '<td>' + metricBars + '</td>' +
+        '<td>' + (s.sampleCount || "?") + ' @ ' + (s.sampleRate || "?") + 'Hz</td>' +
+        '<td style="font-size:10px;color:var(--fg3)">' + (s.ipHash || "").slice(0, 8) + '</td>' +
+        '</tr>';
+
+      // Detail row (hidden by default)
+      html += '<tr class="detail-row" id="detail-' + s.id + '"><td colspan="8">' +
+        '<div class="loading">Loading...</div>' +
+        '</td></tr>';
+    }
+    tbody.innerHTML = html;
+    renderPagination(data.total, data.offset, data.limit);
+  }
+
+  // ─── TOGGLE DETAIL ──────────────────────────────────────────
+  window.toggleDetail = function(id, rowEl) {
+    var detailRow = document.getElementById("detail-" + id);
+    if (!detailRow) return;
+
+    if (detailRow.classList.contains("open")) {
+      detailRow.classList.remove("open");
+      return;
+    }
+
+    // Close all other detail rows
+    var allDetails = document.querySelectorAll(".detail-row.open");
+    for (var i = 0; i < allDetails.length; i++) allDetails[i].classList.remove("open");
+
+    detailRow.classList.add("open");
+
+    // Fetch full session detail
+    apiFetch("/api/admin/session/" + id).then(function(data) {
+      if (!data || !data.ok || !data.session) {
+        detailRow.querySelector("td").innerHTML = '<div class="empty">Failed to load</div>';
+        return;
+      }
+      renderSessionDetail(detailRow.querySelector("td"), data.session);
+    });
+  };
+
+  function renderSessionDetail(container, session) {
+    var html = '<div class="detail-grid">';
+
+    // Overall score
+    html += '<div class="detail-metric">' +
+      '<div class="label">Overall Score</div>' +
+      '<div class="value" style="color:' + scoreColor(session.overall) + '">' + (session.overall * 100).toFixed(1) + '%</div>' +
+      '</div>';
+
+    // Per-metric details
+    if (session.scores) {
+      for (var key in session.scores) {
+        var metric = session.scores[key];
+        var score = typeof metric === "object" ? metric.score : metric;
+        var detail = typeof metric === "object" ? (metric.detail || "") : "";
+        var label = typeof metric === "object" ? (metric.label || key) : key;
+        var weight = typeof metric === "object" ? metric.weight : "";
+
+        html += '<div class="detail-metric">' +
+          '<div class="label">' + label + (weight ? ' (w=' + weight + ')' : '') + '</div>' +
+          '<div class="value" style="color:' + scoreColor(score) + '">' + (typeof score === "number" ? (score * 100).toFixed(1) + '%' : '-') + '</div>' +
+          (detail ? '<div class="info">' + escapeHtml(detail) + '</div>' : '') +
+          '</div>';
+      }
+    }
+
+    // Metadata
+    var meta = [
+      ["Mode", session.mode],
+      ["Input Method", session.inputMethod],
+      ["Sample Rate", session.sampleRate ? session.sampleRate + " Hz" : "-"],
+      ["Sample Count", session.sampleCount],
+      ["Valid Metrics", session.validCount],
+      ["IP Hash", session.ipHash],
+      ["User Agent", session.userAgent],
+    ];
+    if (session.totalHoverTime) meta.push(["Hover Time", session.totalHoverTime + "ms"]);
+    if (session.uniqueElements) meta.push(["Unique Elements", session.uniqueElements]);
+    if (session.plausible !== undefined) meta.push(["Plausible", session.plausible ? "Yes" : "No"]);
+    if (session.deviceProfile) {
+      var dp = session.deviceProfile;
+      meta.push(["Device", dp.type + " " + dp.screenWidth + "x" + dp.screenHeight + " @" + dp.dpr + "x"]);
+    }
+
+    for (var i = 0; i < meta.length; i++) {
+      html += '<div class="detail-metric">' +
+        '<div class="label">' + meta[i][0] + '</div>' +
+        '<div class="info">' + escapeHtml(String(meta[i][1] || "-")) + '</div>' +
+        '</div>';
+    }
+
+    html += '</div>';
+    container.innerHTML = html;
+  }
+
+  // ─── PAGINATION ─────────────────────────────────────────────
+  function renderPagination(total, offset, limit) {
+    var container = document.getElementById("pagination");
+    var page = Math.floor(offset / limit) + 1;
+    var totalPages = Math.ceil(total / limit) || 1;
+    var html = '<button ' + (offset <= 0 ? 'disabled' : '') + ' onclick="changePage(-1)">Prev</button>' +
+      '<span class="page-info">Page ' + page + ' / ' + totalPages + ' (' + total + ' total)</span>' +
+      '<button ' + (offset + limit >= total ? 'disabled' : '') + ' onclick="changePage(1)">Next</button>';
+    container.innerHTML = html;
+  }
+
+  window.changePage = function(dir) {
+    sessionOffset = Math.max(0, sessionOffset + dir * sessionLimit);
+    loadSessions();
+  };
+
+  // ─── UTILS ──────────────────────────────────────────────────
+  function escapeHtml(str) {
+    return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+})();
+</script>
+</body>
+</html>
